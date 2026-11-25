@@ -1,4 +1,5 @@
 #pragma once
+#include "debug_shader_timer.h"
 #include <atomic>
 #include <cfloat>
 #include <cstdlib>
@@ -880,6 +881,7 @@ struct ComputePipeline {
     bool large = false;        // PipelineCompiles limits how many of these compile at once
     bool skipped = false;      // never built on request (LEONIDA_SKIP_COMPUTE): its dispatches are dropped
     std::uint64_t estimate = 0;  // large: the bytes of memory its compile is expected to take
+    bool timed = false;          // LOCAL DEBUG: LEONIDA_DEBUG_TIME_SHADER names its program (debug_shader_timer.h)
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -5374,9 +5376,12 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
                                   &data);
             }
+            auto* const timer = p.pipeline.timed ? leonida::debug_shader_timer::instance().load() : nullptr;
+            const int timed_slot = timer ? timer->begin(command_buffer) : -1;
             for (std::uint32_t k = 0; k < records; ++k) {
                 vk.dispatch_indirect(command_buffer, indirect_buffer, arguments + VkDeviceSize(k) * stride);
             }
+            if (timer) timer->end(command_buffer, timed_slot);
             if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
@@ -5493,7 +5498,12 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                         &set0, 0, nullptr);
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
-            vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+            {
+                auto* const timer = p.pipeline.timed ? leonida::debug_shader_timer::instance().load() : nullptr;
+                const int timed_slot = timer ? timer->begin(command_buffer) : -1;
+                vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+                if (timer) timer->end(command_buffer, timed_slot);
+            }
             if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (raster.state) {
             const Draw* draw = raster.state;

@@ -12388,6 +12388,7 @@ public:
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         compute_entry_ = entry;
+        pipeline_.timed = leonida::debug_shader_timer::matches(entry->name);  // LOCAL DEBUG
         stage_bytes_ = spirv_bytes;
         pipeline_.estimate = leonida::large_module_estimate(spirv_bytes);
         // The title creates hundreds of compute pipelines from job threads during startup and one of its init tasks
@@ -14481,6 +14482,14 @@ public:
                 }
             } else {
                 refresh_title_textures();
+            }
+            // LOCAL DEBUG: LEONIDA_DEBUG_TIME_SHADER (debug_shader_timer.h)
+            if (leonida::debug_shader_timer::wanted()) {
+                auto& vk = state_.context->vk;
+                if (auto* timer = leonida::debug_shader_timer::create(
+                        state_.info.device, state_.clock.get_device_proc, vk.vkCreateQueryPool, vk.vkCmdResetQueryPool,
+                        vk.vkCmdWriteTimestamp, state_.context->timestamp_period()))
+                    timer->poll();
             }
         });
         {
