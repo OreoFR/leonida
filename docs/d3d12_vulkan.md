@@ -2918,6 +2918,20 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   no `LEONIDA_COMPILE_GATE_PROBE_MS`) or `LEONIDA_COMPILE_GATE=1` (with no `LEONIDA_COMPILE_GATE_WAIT_MS`) waits
   however long the creates take and never adapts.
   Tested by `submit_mutex` (no GPU); the probe budget is not yet measured in the title.
+  The verdict is kept per kind of create, compute and graphics (mesh pipelines included), and graphics creates now
+  pass the gate too (before, only compute builds did). On 621.40 every probe beside a compute create came back in
+  0-12 ms (and on an RTX 4060 with 610.88, 133 of them), but a run whose gate those probes had turned off lost the
+  device 9 s later with a submission held 7.8 s beside a mesh create, and with `LEONIDA_COMPILE_GATE=0` a
+  `vkQueueSubmit` sat 54 s in the driver beside a 56 s mesh create (541 KB) and the device was lost. A probe counts
+  for each kind that had a create in the driver from before the submission entered until it came back; a held one
+  counts against all of them, since which create held it cannot be told. A kind that is off is still timed: a
+  submission that stays 2 s or more beside one of its creates turns that kind back on for the rest of the run. While
+  a create of a kind that holds submissions is in the driver, no submission goes ahead, at the limit or the budget,
+  and such a create is waited for even when one went past it before the verdict: the title then starves as long as
+  the create lasts (its watchdog may end the run), but the device is kept. On a device loss the log names every create
+  in the driver (kind, program, SPIR-V size, thread, how long it had been there, whether submissions waited for it)
+  and each kind's gate. Long graphics creates would leave the title's process only through the compile helper, which
+  builds compute pipelines alone today.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.

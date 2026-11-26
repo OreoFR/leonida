@@ -338,7 +338,7 @@ int gate_adapts() {
         EXPECT(passed < 50 && !fresh_ahead);
     }
     std::printf("compile gate: off after two quick probes a second apart, not after two within the second\n");
-    // A held probe: the gate stays on, and quick probes after it change nothing.
+    // A held probe: the gate stays on, and the create is waited for again however long it takes.
     {
         SubmitMutex m;
         m.set_gate_adaptive(true);
@@ -356,34 +356,29 @@ int gate_adapts() {
             std::this_thread::sleep_for(2100ms);
         }
         const Verdict held = m.gate_verdict();
-        { const SubmitMutex::SubmitTurn turn(m); }
-        std::this_thread::sleep_for(1100ms);
-        { const SubmitMutex::SubmitTurn turn(m); }
-        const Verdict still = m.gate_verdict();
-        // Still gating: a create that enters now is waited for.
-        m.set_gate_wait_limit_ms(5000);
-        std::atomic<bool> short_in{false};
-        std::atomic<std::int64_t> short_left_at{0};
-        std::thread short_create([&] {
-            const SubmitMutex::CompileTurn turn(m);
-            short_in = true;
-            std::this_thread::sleep_for(200ms);
-            short_left_at = now_ms();
+        // The create it stayed beside is waited for again, past the limit (its kind holds submissions), until it
+        // leaves.
+        std::atomic<std::int64_t> released_at{0};
+        std::thread releaser([&] {
+            std::this_thread::sleep_for(300ms);
+            released_at = now_ms();
+            release = true;
         });
-        const bool short_entered = eventually([&] { return short_in.load(); });
         std::int64_t entered_at = 0;
+        bool ahead = true;
         {
             const SubmitMutex::SubmitTurn turn(m);
             entered_at = now_ms();
+            ahead = turn.went_ahead();
         }
-        release = true;
+        releaser.join();
         create.join();
-        short_create.join();
-        EXPECT(entered && short_entered);
+        const Verdict still = m.gate_verdict();
+        EXPECT(entered);
         EXPECT(held == Verdict::driver_holds && still == Verdict::driver_holds);
-        EXPECT(entered_at >= short_left_at.load());
+        EXPECT(!ahead && entered_at >= released_at.load());
     }
-    std::printf("compile gate: a probe held 2.1 s keeps it on, later quick probes do not turn it off\n");
+    std::printf("compile gate: a probe held 2.1 s keeps it on, and the create is then waited out past the limit\n");
     return 0;
 }
 
@@ -465,6 +460,8 @@ int gate_probe_budget() {
             std::this_thread::sleep_for(2100ms);
         }
         const Verdict held = m.gate_verdict();
+        release = true;  // the create it stayed beside leaves: it would be waited for again now
+        create.join();
         std::atomic<bool> short_in{false};
         std::atomic<std::int64_t> short_left_at{0};
         std::thread short_create([&] {
@@ -481,8 +478,6 @@ int gate_probe_budget() {
             entered_at = now_ms();
             later_ahead = turn.went_ahead();
         }
-        release = true;
-        create.join();
         short_create.join();
         EXPECT(entered && short_entered && ahead);
         EXPECT(held == Verdict::driver_holds);
@@ -492,13 +487,91 @@ int gate_probe_budget() {
     return 0;
 }
 
+int gate_per_kind() {
+    if (!SubmitMutex::compile_gate_enabled()) {
+        std::printf("compile gate off (LEONIDA_COMPILE_GATE=0): per-kind verdicts not checked\n");
+        return 0;
+    }
+    using Verdict = SubmitMutex::GateVerdict;
+    using Kind = SubmitMutex::CreateKind;
+    SubmitMutex m;
+    m.set_gate_adaptive(true);
+    m.set_gate_wait_limit_ms(100);
+    m.set_gate_probe_budget_ms(0);
+    const SubmitMutex::CreateInfo compute{Kind::compute, "test compute", "test", 1000};
+    const SubmitMutex::CreateInfo graphics{Kind::graphics, "test mesh", "test", 2000};
+    // A compute create that stays until let go; the compute gate goes off after two quick probes a second apart.
+    std::atomic<bool> c_in{false}, c_release{false};
+    std::atomic<std::int64_t> c_left_at{0};
+    std::thread c([&] {
+        const SubmitMutex::CompileTurn turn(m, compute);
+        c_in = true;
+        while (!c_release) std::this_thread::sleep_for(1ms);
+        c_left_at = now_ms();
+    });
+    const bool c_entered = eventually([&] { return c_in.load(); });
+    { const SubmitMutex::SubmitTurn turn(m); }  // goes ahead at the limit: the first quick probe
+    std::this_thread::sleep_for(1100ms);
+    { const SubmitMutex::SubmitTurn turn(m); }  // the second
+    const Verdict compute_off = m.gate_verdict(Kind::compute), graphics_before = m.gate_verdict(Kind::graphics);
+    // A graphics create is still waited for: its kind has no verdict, so the submission goes ahead only at the limit.
+    std::atomic<bool> g_in{false}, g_release{false};
+    std::thread g([&] {
+        const SubmitMutex::CompileTurn turn(m, graphics);
+        g_in = true;
+        while (!g_release) std::this_thread::sleep_for(1ms);
+    });
+    const bool g_entered = eventually([&] { return g_in.load(); });
+    std::int64_t g_waited = 0;
+    bool g_ahead = false;
+    {
+        const std::int64_t start = now_ms();
+        const SubmitMutex::SubmitTurn turn(m);
+        g_waited = now_ms() - start;
+        g_ahead = turn.went_ahead();
+    }
+    g_release = true;
+    g.join();
+    const Verdict graphics_after = m.gate_verdict(Kind::graphics);  // one quick probe: still pending
+    // Re-arm: beside the compute create (gate off), a submission stays 2.1 s in the "driver".
+    { const SubmitMutex::SubmitTurn turn(m); std::this_thread::sleep_for(2100ms); }
+    const Verdict compute_rearmed = m.gate_verdict(Kind::compute);
+    // The compute create is waited for again, and not gone past at the limit: its kind holds submissions.
+    std::atomic<std::int64_t> released_at{0};
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(400ms);
+        released_at = now_ms();
+        c_release = true;
+    });
+    std::int64_t entered_at = 0;
+    bool after_ahead = true;
+    {
+        const SubmitMutex::SubmitTurn turn(m);
+        entered_at = now_ms();
+        after_ahead = turn.went_ahead();
+    }
+    releaser.join();
+    c.join();
+    EXPECT(c_entered && g_entered);
+    EXPECT(compute_off == Verdict::driver_does_not_hold && graphics_before == Verdict::pending);
+    EXPECT(g_ahead && g_waited >= 90 && g_waited < 1000);
+    EXPECT(graphics_after == Verdict::pending);
+    EXPECT(compute_rearmed == Verdict::driver_holds);
+    EXPECT(!after_ahead && entered_at >= c_left_at.load() && entered_at >= released_at.load());
+    m.report_creates_on_loss();  // nothing in the driver now: the verdicts only
+    std::printf("compile gate: compute off with graphics still gated; a 2.1 s submission re-armed compute, and the next "
+                "one waited %lld ms past the 100 ms limit for the compute create\n",
+                static_cast<long long>(entered_at - (released_at.load() - 400)));
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (owner_tracking() || waits_for_holder() || waits_for_queued_submitter() || handoff_is_capped() ||
         compile_gate() || gate_wait_limit() || gate_adapts() ||
-        gate_probe_budget())
+        gate_probe_budget() || gate_per_kind())
         return 1;
     std::printf("submit_mutex_test: all passed\n");
     return 0;

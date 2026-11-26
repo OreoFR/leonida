@@ -2073,7 +2073,7 @@ public:
     }
 
     void mark_device_lost(const char* where = "a Vulkan call returned VK_ERROR_DEVICE_LOST") noexcept {
-        set_device_lost(device_lost_, where);
+        if (set_device_lost(device_lost_, where)) submit_mutex_.report_creates_on_loss();  // which creates were in it
         run_device_lost_hook();  // LEONIDA_AFTERMATH: the GPU crash dump is written before waiters wake
         if (fence_dispatcher_) {
             try {
