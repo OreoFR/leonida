@@ -2308,10 +2308,11 @@ private:
                 if (gate.submits != gate_logged.submits || gate.creates != gate_logged.creates) {
                     gate_logged = gate;
                     std::fprintf(stderr, "[rt] compile-gate: t=%.0f s: %llu submissions waited for pipeline creates "
-                                         "(%lld ms in all, longest %lld ms); %llu creates waited behind a submission "
-                                         "(%lld ms in all, longest %lld ms)\n",
+                                         "(%lld ms in all, longest %lld ms, %llu went ahead at the limit); %llu creates "
+                                         "waited behind a submission (%lld ms in all, longest %lld ms)\n",
                                  double(diagnostic_ms()) / 1000.0, static_cast<unsigned long long>(gate.submits),
                                  static_cast<long long>(gate.submit_ms), static_cast<long long>(gate.submit_max_ms),
+                                 static_cast<unsigned long long>(gate.ahead),
                                  static_cast<unsigned long long>(gate.creates), static_cast<long long>(gate.create_ms),
                                  static_cast<long long>(gate.create_max_ms));
                 }

@@ -2882,6 +2882,42 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   title submits (a submission in the last second, `src/pipeline_wait.h`); the pipeline is built at its first use
   instead. Opt-in: unset or 0, every warm-up runs, as on `main`, and `LargeModuleGate` (#1889) orders them behind a
   submission's compiles. Smaller warm-ups, and every warm-up before the first submission, run as before.
+- **A bounded, adaptive compile gate** (`SubmitMutex::enter_submit`, `src/vulkan_device_fault.h`). The gate keeps a
+  `vkQueueSubmit` out of the driver while a create is in it, since on NVIDIA 630.20 one that entered during a long
+  `vkCreateComputePipelines` waited 10 s and lost the device. The waiting submission holds the submit lock, so all
+  queues stop: on an RTX 4070 Laptop (NVIDIA 621.40) one compute create of a 2.3 MB module stayed in the driver for
+  more than 54 s during the story load, the submission waited for all of it and the title's 30 s hang watchdog ended
+  the process; with `LEONIDA_COMPILE_GATE=0` the same build went past that point. A submission now waits at most
+  `LEONIDA_COMPILE_GATE_WAIT_MS` (15 s by default) and then goes ahead; the creates in the driver at that moment hold
+  no later submission back, and creates that enter after it are waited for again. On 630.20 that loses only creates
+  over 25 s (15 s here, then the driver's 10 s), which the watchdog ends anyway.
+  On the same laptop the three submissions that went ahead came back from the driver in 11, 1 and 0 ms with the
+  create still there, and no device was lost; but consecutive long creates made submissions wait the full 15 s again
+  and again, and the title's watchdog still ended the run. So by default the gate adapts: every submission that
+  enters the driver next to a create it no longer waits for is a probe. Two that come back in under 250 ms, at least
+  1 s apart, with that create still in the driver turn the gate off for the rest of the run (a driver that holds a
+  submission behind a create holds it as long as the create stays, and 630.20 held one for the full 10 s). Two, and a
+  second apart, because back-to-back creates take and release that driver's lock, so one submission can slip in
+  between; the second costs no extra wait, since after one has gone ahead the next enter at once while the create is
+  still there. One probe that stays 2 s or more keeps the gate on for the rest of the run; the turn also covers
+  presents and idle waits, so it can be a false alarm, but it only keeps the bounded gate. Both verdicts are logged
+  once. `LEONIDA_COMPILE_GATE=1` gates always and never probes.
+  In the next run on that laptop the story load passed, but no wait reached 15 s, so no probe came: 80 submissions
+  waited 3-7 s each (90 s in all, the longest 6.7 s), back to back, and the title's watchdog ended the run at 433 s.
+  So until a verdict is in, a submission also goes ahead once the submissions' waits at the gate in the last 10 s, its
+  own included, add up to `LEONIDA_COMPILE_GATE_PROBE_MS` (2500 ms). A budget over a
+  window rather than a shorter limit per wait, because it also counts many short waits, and one wait reaches it as
+  soon as a 2.5 s limit would. Before the verdict the gate then stops the queues for at most about a quarter of any
+  10 s, after a quick verdict not at all. On a driver that does hold submissions (630.20) the first probe now enters
+  the driver after 2.5 s of waiting instead of 15 s, and loses the device if the create stays there 10 s more: one
+  probe per run, since the held verdict, 2 s into that probe, ends the early probes and leaves only the per-wait
+  limit. The held threshold stays 2 s, well inside the 10 s such a driver gives before the loss. The limit and the
+  budget apply with the title's watchdog kept kicked too (`LEONIDA_TITLE_WATCHDOG=0` and
+  `LEONIDA_TITLE_WATCHDOG_KICK`): nothing ends the run then, but the stops still cost the frames, and an RTX 4060 run
+  that way had 459 waits, 155 s in all and the longest 2.9 s, by t=202 s. Only `LEONIDA_COMPILE_GATE_WAIT_MS=0` (with
+  no `LEONIDA_COMPILE_GATE_PROBE_MS`) or `LEONIDA_COMPILE_GATE=1` (with no `LEONIDA_COMPILE_GATE_WAIT_MS`) waits
+  however long the creates take and never adapts.
+  Tested by `submit_mutex` (no GPU); the probe budget is not yet measured in the title.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
