@@ -909,6 +909,11 @@ if(BUILD_TESTING)
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
 
+  # Which pipelines LEONIDA_ASYNC_PIPELINES=1 builds asynchronously by size (LEONIDA_ASYNC_MIN_BYTES,
+  # src/async_pipeline_size.h): pure stdlib.
+  add_executable(async_pipeline_size_test test/async_pipeline_size_test.cpp)
+  add_test(NAME async_pipeline_size COMMAND async_pipeline_size_test)
+
   # The gate of large_module_gate.h as the runtime uses it for large pipelines (LEONIDA_BIG_COMPILE_BUDGET_MB): pure
   # stdlib.
   add_executable(big_compile_gate_test test/big_compile_gate_test.cpp)
@@ -3733,6 +3738,10 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_m4_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m4_compute COMMAND d3d12_m4_compute_test)
       set_tests_properties(d3d12_m4_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # LEONIDA_ASYNC_PIPELINES=1 with LEONIDA_ASYNC_MIN_BYTES over both modules and the compile worker held: the
+      # dispatches build their pipelines in place, as with asynchronous builds off (src/async_pipeline_size.h).
+      add_test(NAME d3d12_m4_compute_async_small_waits COMMAND d3d12_m4_compute_test --async-small-waits)
+      set_tests_properties(d3d12_m4_compute_async_small_waits PROPERTIES SKIP_RETURN_CODE 77)
 
       # Typed buffer UAVs and UAV counters: cs_buf_typed.asm writes typed views through V#s with a FORMAT, and
       # cs_buf_counter.asm appends to and consumes from a structured view whose counter is the second V# of its slot;

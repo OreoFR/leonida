@@ -12540,7 +12540,8 @@ public:
             // A cache-only create that the driver would have to compile stays null: the first draw builds it.
             if (!graphics_.pipeline && !(cache_only && compile_status == VK_PIPELINE_COMPILE_REQUIRED)) return E_FAIL;
         }  // lazy: graphics_.pipeline stays null and the first draw builds it as variant 0
-        graphics_.async_build = async_replay_compile();
+        // LEONIDA_ASYNC_MIN_BYTES: a pipeline smaller than that (all its stages) is built where a draw needs it.
+        graphics_.async_build = async_replay_compile(spirv_bytes);
         graphics_.variant = [this](std::uint32_t unbound) {
             return replay_pipeline("draw", [&] {
                 return graphics_.async_build ? queue_build(false, unbound) : variant(unbound, "draw");
@@ -12709,7 +12710,8 @@ public:
             };
             pipeline_.build_context = this;
         } else if (lazy_compute) {
-            pipeline_.async_build = async_replay_compile();
+            // LEONIDA_ASYNC_MIN_BYTES: a module smaller than that is built where a dispatch needs it.
+            pipeline_.async_build = async_replay_compile(spirv_bytes);
             pipeline_.build = [](void* self) {
                 auto* pso = static_cast<PipelineState*>(self);
                 return replay_pipeline("dispatch", [&] {
@@ -12785,7 +12787,8 @@ private:
         // (LOCAL FIX, review: with LEONIDA_ASYNC_PIPELINES=1 it was deferred and returned E_FAIL).
         const bool warmup = !std::strcmp(trigger, "warmup");
         const bool replay_trigger = !std::strcmp(trigger, "dispatch") || !std::strcmp(trigger, "dispatch-worker");
-        const bool helper_nowait = warmup || (replay_trigger && async_replay_compile());
+        // An asynchronous pipeline only (one under LEONIDA_ASYNC_MIN_BYTES waits for the file, as without them).
+        const bool helper_nowait = warmup || (replay_trigger && pipeline_.async_build);
         if (!helper_file_.empty()) {
             auto& helper = compile_helper::Client::instance();
             std::string why;
@@ -12894,7 +12897,7 @@ private:
                     // The compile helper is still making the journal file (build_compute): not built, so nothing is
                     // published and the next use asks again.
                     const bool deferred = compute && helper_deferred_.exchange(false);
-                    if (async_replay_compile()) {
+                    if (compute ? pipeline_.async_build : graphics_.async_build) {
                         unsigned long long skipped = 0;
                         {
                             std::lock_guard publish(publication);
@@ -12965,6 +12968,8 @@ public:
     // Never waits; nothing to do when the variant is the last one asked for here.
     void request_early(std::uint32_t bound_targets, bool depth_bound) {
         if (!async_replay_compile() || !registered_) return;
+        // A pipeline under LEONIDA_ASYNC_MIN_BYTES is built where it is needed, as without asynchronous builds.
+        if (!(is_graphics_ ? graphics_.async_build : pipeline_.async_build)) return;
         std::uint32_t unbound = 0;
         if (is_graphics_) {
             for (std::size_t slot = 0; slot < graphics_.color_formats.size() && slot < 8; ++slot)
