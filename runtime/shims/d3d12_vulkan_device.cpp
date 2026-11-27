@@ -4612,6 +4612,46 @@ struct DeviceState {
         std::uint32_t gpu_high = 0;  // one past the highest slot the title has written (a rescan's range)
     };
     std::mutex console_heap_mutex;  // taken before title_window_mutex, shadow_mutex and descriptor_mutex
+    // Who holds console_heap_mutex, for the slow-refresh line (RT-HEAP-PHASE-LOCK-WAITS): the thread and which of the
+    // places that take it. Set right after the lock is taken and cleared right before it is released; read without
+    // the lock, so it is a hint (the holder can change between the read and the wait).
+    enum class HeapLockSite : std::uint32_t { none, refresh, create, remove, guard };
+    std::atomic<std::uint32_t> console_heap_holder_thread{0};
+    std::atomic<std::uint32_t> console_heap_holder_site{0};
+    struct HeapLockNote {  // declared after the lock_guard it describes, so it is destroyed (cleared) first
+        DeviceState& state;
+        HeapLockNote(DeviceState& s, HeapLockSite site) : state(s) {
+            state.console_heap_holder_site.store(std::uint32_t(site), std::memory_order_relaxed);
+            state.console_heap_holder_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        }
+        ~HeapLockNote() {
+            state.console_heap_holder_thread.store(0, std::memory_order_relaxed);
+            state.console_heap_holder_site.store(0, std::memory_order_relaxed);
+        }
+    };
+    static const char* heap_lock_site_name(std::uint32_t site) {
+        switch (HeapLockSite(site)) {
+        case HeapLockSite::refresh: return "refresh_console_heaps";
+        case HeapLockSite::create: return "a heap's creation";
+        case HeapLockSite::remove: return "remove_console_heap";
+        case HeapLockSite::guard: return "the address guard's heap spans";
+        default: return "unknown";
+        }
+    }
+    // LEONIDA_HEAP_SLOW_MS (250 by default, 0: off): a refresh_console_heaps call that takes at least this long,
+    // counting its wait for the locks, logs one line of its own with where its time went.
+    static double heap_slow_ms() {
+        static const double ms = [] {
+            char text[16] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_HEAP_SLOW_MS", text, sizeof(text));
+            return n > 0 && n < sizeof(text) ? std::strtod(text, nullptr) : 250.0;
+        }();
+        return ms;
+    }
+    // Every refresh_console_heaps call's wait for console_heap_mutex since the last heap line (console_heap_mutex
+    // held when written; the 10 s heap line prints and clears it).
+    double heap_lock_wait_ms = 0, heap_lock_wait_max_ms = 0, heap_gpu_pass_ms = 0;
+    std::uint64_t heap_lock_waits = 0;
     std::vector<std::unique_ptr<ConsoleHeap>> console_heaps;
 
     // Null slots after a shader-visible resource heap's GPU copy. A directly indexed heap is read at
@@ -4913,28 +4953,98 @@ struct DeviceState {
 
     // Before every submission, ahead of the slot-133 shadows.
     void refresh_console_heaps() {
+        using clock = std::chrono::steady_clock;
+        const auto since = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const auto entered = clock::now();
+        // Who held the lock as this call started to wait for it (a hint: read without the lock).
+        const std::uint32_t held_by = console_heap_holder_thread.load(std::memory_order_relaxed);
+        const std::uint32_t held_at = console_heap_holder_site.load(std::memory_order_relaxed);
         std::lock_guard lock(console_heap_mutex);
+        const HeapLockNote note(*this, HeapLockSite::refresh);
+        const auto locked = clock::now();
+        const double lock_wait = since(entered, locked);
+        heap_lock_wait_ms += lock_wait;
+        heap_lock_wait_max_ms = (std::max)(heap_lock_wait_max_ms, lock_wait);
+        ++heap_lock_waits;
         const bool heap_pass = heap_gpu && console_heap_gpu_enabled();
         if (heap_pass) console_heap_gpu_begin();
         else if (heap_gpu) heap_gpu->drain(context->completed_retire_ticket(), [](int, std::uint32_t, std::uint32_t) {}, [](int) {});
+        const auto gpu_begun = clock::now();
+        // The slow-refresh line (LEONIDA_HEAP_SLOW_MS): what this one call did, written at its end, after the GPU
+        // pass's end below (declared first, so destroyed last).
+        struct SlowLine {
+            DeviceState& state;
+            clock::time_point entered, locked, gpu_begun;
+            double lock_wait, change_wait = 0, heaps_ms = 0, pages_ms = 0, fix_ms = 0, record_ms = 0, retry_ms = 0;
+            double gpu_end_ms = 0;
+            std::size_t changes = 0, heaps = 0;
+            std::uint64_t looked = 0, refixed = 0;
+            std::uint32_t held_by, held_at;
+            ~SlowLine() {
+                const auto done = clock::now();
+                const double total = std::chrono::duration<double, std::milli>(done - entered).count();
+                const double gpu_begin_ms = std::chrono::duration<double, std::milli>(gpu_begun - locked).count();
+                state.heap_gpu_pass_ms += gpu_begin_ms + gpu_end_ms;
+                const double slow = heap_slow_ms();
+                if (slow <= 0 || total < slow) return;
+                char holder[96] = "free";
+                if (held_by)
+                    std::snprintf(holder, sizeof(holder), "held by thread %lu in %s",
+                                  static_cast<unsigned long>(held_by), heap_lock_site_name(held_at));
+                std::fprintf(stderr,
+                             "[rt] d3d12: slow console heap refresh on thread %lu at t=%.1f s: %.1f ms = waited %.1f "
+                             "for console_heap_mutex (%s as the wait began), %.1f for the "
+                             "change list, GPU heap pass %.1f (begin or drain %.1f, end %.1f), %zu heap(s) %.1f "
+                             "(pages %.1f, fixing copied slots %.1f, slot records %.1f for %zu changes: %llu looked at, "
+                             "%llu fixed again; retries %.1f), other %.1f\n",
+                             GetCurrentThreadId(), leonida::submit_phases::process_age(), total, lock_wait,
+                             holder,
+                             change_wait, gpu_begin_ms + gpu_end_ms, gpu_begin_ms, gpu_end_ms, heaps, heaps_ms,
+                             pages_ms, fix_ms, record_ms, changes, static_cast<unsigned long long>(looked),
+                             static_cast<unsigned long long>(refixed), retry_ms,
+                             total - lock_wait - change_wait - gpu_begin_ms - gpu_end_ms - heaps_ms);
+            }
+        } slow_line{*this, entered, locked, gpu_begun, lock_wait};
+        slow_line.held_by = held_by;
+        slow_line.held_at = held_at;
         struct GpuEnd {  // after every heap's slots are queued, however the loop ends
             DeviceState& state;
             bool on;
+            double& ms;
             ~GpuEnd() {
-                if (on) state.console_heap_gpu_end();
+                if (!on) return;
+                const auto start = clock::now();
+                state.console_heap_gpu_end();
+                ms = std::chrono::duration<double, std::milli>(clock::now() - start).count();
             }
-        } gpu_end{*this, heap_pass};
+        } gpu_end{*this, heap_pass, slow_line.gpu_end_ms};
         // Every change since the last submission, for every heap; one made from now on (by another thread, or by a
         // fix below making a window) is applied at the next submission.
         std::vector<leonida::SlotChange> changes;
         {
+            const auto asked = clock::now();
             std::lock_guard taken(slot_change_mutex);
+            slow_line.change_wait = since(asked, clock::now());
             changes.swap(slot_changes);
         }
+        slow_line.changes = changes.size();
         for (const auto& heap : console_heaps) {
             const auto start = std::chrono::steady_clock::now();
+            const double pages0 = heap->pages_ms, fix0 = heap->fix_ms, retry0 = heap->retry_ms, record0 = heap->record_ms;
+            const std::uint64_t looked0 = heap->record_looked, refixed0 = heap->record_refixed;
             refresh_console_heap(*heap, &changes);
-            heap->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            const double took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            heap->ms += took;
+            ++slow_line.heaps;
+            slow_line.heaps_ms += took;
+            slow_line.pages_ms += heap->pages_ms - pages0;
+            slow_line.fix_ms += heap->fix_ms - fix0;  // includes the slot records' share
+            slow_line.record_ms += heap->record_ms - record0;
+            slow_line.retry_ms += heap->retry_ms - retry0;
+            slow_line.looked += heap->record_looked - looked0;
+            slow_line.refixed += heap->record_refixed - refixed0;
             ++heap->refreshes;
             // A line at the first and 64th submission, then every 10 s (a crawl logs as often as a fast run).
             const bool logged = heap->refreshes == 1 || heap->refreshes == 64 ||
@@ -4995,6 +5105,18 @@ struct DeviceState {
                 heap->record_ms = 0;
             }
             if (heap->gpu >= 0) log_console_heap_gpu(*heap, count);
+            if (heap.get() == console_heaps.front().get() && heap_lock_waits) {
+                // Every refresh_console_heaps call since the last line, all heaps: the wait for the lock, which the
+                // per-heap milliseconds above leave out, and the GPU heap pass around the heaps' loop.
+                std::fprintf(stderr,
+                             "[rt] d3d12: console heap refreshes since the last line: %llu, waited %.3f ms on average "
+                             "(max %.1f) for console_heap_mutex; GPU heap pass %.3f ms on average\n",
+                             static_cast<unsigned long long>(heap_lock_waits),
+                             heap_lock_wait_ms / double(heap_lock_waits), heap_lock_wait_max_ms,
+                             heap_gpu_pass_ms / double(heap_lock_waits));
+                heap_lock_wait_ms = heap_lock_wait_max_ms = heap_gpu_pass_ms = 0;
+                heap_lock_waits = 0;
+            }
             std::string refused_breakdown;
             for (const auto& [reason, count] : heap->refused_reasons)
                 refused_breakdown += (refused_breakdown.empty() ? "" : "; ") + reason + " " + std::to_string(count);
@@ -5214,6 +5336,7 @@ struct DeviceState {
             attach_console_heap_gpu(*heap);
         {
             std::lock_guard lock(console_heap_mutex);
+            const HeapLockNote note(*this, HeapLockSite::create);
             if (heap->gpu >= 0) gpu_heaps[std::size_t(heap->gpu)] = heap.get();
             if (!imported) refresh_console_heap(*heap, nullptr);
             if (heap->copy) {
@@ -5250,6 +5373,7 @@ struct DeviceState {
         std::unique_ptr<ConsoleHeap> heap;
         {
             std::lock_guard lock(console_heap_mutex);
+            const HeapLockNote note(*this, HeapLockSite::remove);
             const auto it = std::find_if(console_heaps.begin(), console_heaps.end(),
                                          [console_va](const auto& h) { return h->console_va == console_va; });
             if (it == console_heaps.end()) return;
@@ -6126,6 +6250,7 @@ struct DeviceState {
         std::uint64_t heap_signature = 0xcbf29ce484222325ull;
         {
             std::lock_guard heaps(console_heap_mutex);
+            const HeapLockNote note(*this, HeapLockSite::guard);
             for (const auto& h : console_heaps) {
                 if (!h || !h->bytes) continue;
                 const std::uint64_t begin = h->shader_va, end = h->shader_va + h->bytes + h->guard;
