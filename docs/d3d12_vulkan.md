@@ -2788,6 +2788,45 @@ Pipeline creation:
   a submission waits for them, and what is skipped, is "Pipelines still being built" below. Strict replay builds
   synchronously and waits for every build. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by
   the title.
+  `LEONIDA_PIPELINE_ORDER_LOG=1` records the order in which the title first asks for pipelines
+  (RT-PIPELINE-PREWARM-ORDER, phase 1; `runtime/src/pipeline_order.h`). It is off by default: nothing reads the file yet,
+  so a run that does not ask for it writes nothing and its pipelines carry no hook. For each pipeline and variant (the
+  unbound-slot mask for graphics, 0 for compute) that a dispatch or draw names for the first time, one line is
+  appended to `pipeline_order.log` beside `pipeline_cache.session.bin` (so `LEONIDA_PIPELINE_CACHE_DIR` moves it):
+  `P <c|g|m> <key> <variant hex> <created ms> <first use ms> <build ms or -> <ready 0|1> *<checksum>`, with the
+  times in milliseconds since the process started. The key is the SHA-256 of the title's own description of the PSO
+  (`GetCachedBlob`'s key; a mesh pipeline's MS is folded in), not of the SPIR-V, so a translator change keeps it. A
+  build that ends after its line was written adds `B <key> <variant hex> <build ms> *<checksum>`; a session starts
+  with `S 1 <vendor hex> <device hex>`. Each line ends with an FNV-1a checksum: a cut or damaged line is skipped on
+  read, never fatal. The hook sits in replay's `ComputePipeline::requested` / `GraphicsPipeline::requested`, called
+  where a submission is prepared, also for a handle that exists already (a warm-up build, a cached one); the
+  recorder decides "first" with one compare-and-swap in a table made at start, never blocks and allocates nothing (a non-blocking `try_lock` on the first request of a pipeline and of a variant),
+  and a thread of its own appends every 250 ms, so a killed process loses at most that. The record holds 8192 lines
+  per run (the rest is counted, not kept); a file past 8 MiB is set aside as `pipeline_order.log.prev`. At exit (the
+  exit cache save, or the device's release) one line gives the counts: `[rt] pipeline-order: requested N, already
+  ready M, median lead X ms`. "Lead" is first use minus creation. A PSO made from a pipeline state stream on the
+  console path is created when it is first bound, so its lead is the title's, not an upper bound on a head start.
+  A root signature the runtime does not know is hashed by its address, so the key of a pipeline made with one can
+  change from one run to the next. The file is local, like the cache files, and is not meant to be attached to a
+  report: quote the counts. It changes no build, order or cache.
+  `LEONIDA_PIPELINE_PREWARM_ORDER=<file>` reads such a log at boot and builds, ahead of their first draw, the graphics
+  and mesh pipelines an earlier run asked for first (RT-PIPELINE-PREWARM-ORDER, phase 2; `runtime/src/pipeline_prewarm.h`).
+  `1` names `pipeline_order.log` beside the session cache; it is read before this run's own record is appended, so
+  both variables can be on together. Of the runs recorded on this GPU (vendor and device id), the one with the most
+  records is read, the newest on a tie. When the title creates a PSO whose key is in it, each recorded variant is
+  queued on the compile workers as a warm-up at its recorded rank: after every demanded build, one warm-up at a time
+  and none while a demanded build runs (`PipelineCompiler`; the compile-gate finding in "Compile workers" below is
+  why), ahead of the compute warm-up's size order and before the cache checkpoint. A variant 0 built at create is
+  skipped. A console stream kept for its first bind (`LEONIDA_PIPELINE_COMPILE=on-demand`) is otherwise parsed only
+  there, which would leave the prewarm no lead: when its pipeline is in the plan, the parse is queued as its first
+  prewarm job instead (at the rank of its first recorded variant, on a compile worker), and its variants follow with
+  their ranks. A bind that comes first waits for that parse, which it would otherwise have done itself. Records are taken in order until their recorded build times add up to
+  `LEONIDA_PIPELINE_PREWARM_BUDGET_MS` (default 300000; a record with no build time counts 1000 ms), and at most
+  `LEONIDA_PIPELINE_PREWARM_MAX_ENTRIES` (default 4096). Compute records are left to the compute warm-up and to
+  `gta6rt --precompile-pipelines`. A missing or unreadable file, a file with no readable record and a file from
+  another GPU are ignored with one `[rt] pipeline-prewarm:` line; a damaged line is skipped, as are line types a v1
+  reader does not know (`E`). A queued prewarm holds no reference: a PSO released first drops it. One that is already
+  running when the title submits still holds the compile gate (`LEONIDA_COMPILE_GATE`), as any warm-up does.
   A queued build holds no reference to its PSO or device (`PipelineCompiler`, `runtime/shims/d3d12_pipeline_compile.h`).
   A PSO's last release drops its queued builds and returns at once; one already running is left to finish, and the
   worker deletes the PSO after it (`PipelineState::last_release`). The PSO's device reference goes at the release, so
@@ -2874,6 +2913,21 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   at record time already: at `SetPipelineState` for compute and at each draw for graphics, with the variant its bound
   targets give (`request_pipeline_build`). A compute build the compile helper is still making (`LEONIDA_COMPILE_HELPER`)
   publishes nothing, so its next use asks again.
+- **Compile workers** (RT-ASYNC-COMPILE-POOL, after MoonEyes' design in #2077). The jobs above, the compute warm-up
+  and the cache checkpoint run on `LEONIDA_COMPILE_THREADS` workers (half the logical processors, 2 to 8). With one
+  worker a driver compile of minutes held every pipeline a submission asked for behind it, and their draws and
+  dispatches were skipped meanwhile. A worker now takes the most urgent job it may: demanded builds first, in the
+  order they came, then warm-ups by module size, then the checkpoint, which waits until no worker compiles. Large
+  builds (compute over 128 KiB, graphics of 1 MiB or more) and warm-ups together take at most threads-1 workers, so
+  one is always free for a small demanded build; at most `LEONIDA_COMPILE_HEAVY_MAX` large builds run at once (default
+  threads-1, 1 with `LEONIDA_SERIAL_BIG_COMPILES=1`), each still within the memory gate; warm-ups run one at a time,
+  as before, and none starts while a demanded build is queued or running, since each holds the compile gate for its
+  whole create (MoonEyes measured in #1608 that with the gate on, submissions waited 142 s in all behind warm-ups of
+  about 800 KB, and that with `LEONIDA_COMPILE_GATE=0` the same boot reached game state 3); and a PSO has one build
+  running at a time, so
+  `after_running` and the teardown rules hold as they were. `LEONIDA_COMPILE_THREADS=1` is the layout before the pool:
+  one general worker and the graphics-only one. A submission still waits at the compile gate for every create in
+  flight, so more workers do not shorten that wait (`SubmitMutex::CompileTurn`; `LEONIDA_COMPILE_GATE=0` turns it off).
 - **Warm-ups while the title submits.** A compute warm-up holds the compile gate for its whole create, and every
   submission waits behind it: a native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and
   past the story load the worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s
