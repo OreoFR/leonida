@@ -445,7 +445,11 @@ public:
     // every kind whose gate is not off; the probe budget applies only while all of those are of kinds still pending.
     // A kind that is off is still timed: a submission that stays kProbeHeldMs or more beside one of its creates turns
     // that kind's gate back on for the rest of the run (logged once), so the submissions after it wait. The one that
-    // stayed cannot be helped. A submission never goes ahead (at the limit or the budget) while a create of a kind
+    // stayed cannot be helped. A held probe counts only if the submission came back within kHeldReturnMs after a
+    // create of that kind, there when it entered, left the driver: a submission held behind a create comes back when
+    // the create does. One that comes back slow with its creates still there was slow for another reason (on 621.40,
+    // a 36 s submission came back 18 s before the compute create beside it, and the 4070 Laptop's 8 GB were full);
+    // counting it re-armed the gate and starved the title for 78 s behind creates that were not holding anything. A submission never goes ahead (at the limit or the budget) while a create of a kind
     // that holds submissions is in the driver, and such creates are waited for even if one was gone past before the
     // verdict: on 621.40, with the gate off, a vkQueueSubmit sat 54 s in the driver beside a 56 s mesh create and the
     // device was lost; waiting here starves the title as long, but keeps the device. Graphics creates pass the gate
@@ -455,6 +459,7 @@ public:
     enum class GateVerdict { pending, driver_does_not_hold, driver_holds };
     static constexpr std::int64_t kProbeQuickMs = 250;
     static constexpr std::int64_t kProbeHeldMs = 2000;
+    static constexpr std::int64_t kHeldReturnMs = 500;
     static constexpr std::int64_t kProbeSpanMs = 1000;
     static constexpr unsigned kQuickProbes = 2;
     static constexpr std::int64_t kProbeWindowMs = 10000;
@@ -626,6 +631,9 @@ public:
         std::lock_guard lock(gate_mutex_);
         for (auto it = in_driver_.begin(); it != in_driver_.end(); ++it)
             if (it->seq == seq) {
+                const std::size_t k = std::size_t(it->info.kind);
+                last_leave_ms_[k] = diagnostic_ms();
+                last_leave_seq_[k] = seq;
                 in_driver_.erase(it);
                 break;
             }
@@ -848,8 +856,25 @@ private:
                          diagnostic_thread_id(), static_cast<long long>(took), still, ahead.creates);
         }
         if (!adaptive_) return;
-        for (std::size_t k = 0; k < kKinds; ++k)
-            if (kinds & (1u << k)) judge(CreateKind(k), took, now);
+        for (std::size_t k = 0; k < kKinds; ++k) {
+            if (!(ahead.kinds & (1u << k))) continue;
+            if (took >= kProbeHeldMs) {
+                // Held behind a create of this kind only if one it entered beside has just left.
+                const bool left_just_before = last_leave_seq_[k] != 0 && last_leave_seq_[k] <= ahead.last_create &&
+                                              last_leave_ms_[k] >= ahead.since_ms &&
+                                              now - last_leave_ms_[k] <= kHeldReturnMs;
+                if (left_just_before) {
+                    judge(CreateKind(k), took, now);
+                } else if (logged_not_held_++ < 8) {
+                    std::fprintf(stderr, "[rt] compile-gate: a submission stayed %lld ms in the driver beside a %s "
+                                         "create but came back %s: not counted as held by it\n",
+                                 static_cast<long long>(took), kind_name(CreateKind(k)),
+                                 (kinds & (1u << k)) ? "with the create still there" : "long after the create left");
+                }
+            } else if (kinds & (1u << k)) {
+                judge(CreateKind(k), took, now);
+            }
+        }
     }
     void judge(CreateKind kind, std::int64_t took, std::int64_t now) {
         const std::size_t k = std::size_t(kind);
@@ -939,6 +964,10 @@ private:
     // Per CreateKind.
     std::array<GateVerdict, kKinds> verdict_{GateVerdict::pending, GateVerdict::pending};
     std::array<bool, kKinds> rearmed_{};
+    // When the last create of each kind left the driver, and its number: a held probe needs one to have just left.
+    std::array<std::int64_t, kKinds> last_leave_ms_{};
+    std::array<std::uint64_t, kKinds> last_leave_seq_{};
+    unsigned logged_not_held_ = 0;
     std::array<unsigned, kKinds> quick_probes_{};
     std::array<std::int64_t, kKinds> first_quick_ms_{}, longest_quick_ms_{};
     unsigned logged_held_waits_ = 0;

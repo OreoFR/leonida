@@ -2925,7 +2925,14 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   `vkQueueSubmit` sat 54 s in the driver beside a 56 s mesh create (541 KB) and the device was lost. A probe counts
   for each kind that had a create in the driver from before the submission entered until it came back; a held one
   counts against all of them, since which create held it cannot be told. A kind that is off is still timed: a
-  submission that stays 2 s or more beside one of its creates turns that kind back on for the rest of the run. While
+  submission that stays 2 s or more beside one of its creates turns that kind back on for the rest of the run. A
+  held probe (pending or off) counts only if the submission came back within 500 ms after a create of that kind,
+  there when it entered, left the driver: a submission held behind a create comes back when the create does. On the
+  4070 Laptop (621.40, 8 GB nearly full) a 36 s submission came back 18 s before the 58 s compute create beside it;
+  counted as held, it re-armed the gate, which then kept the next submission 78 s behind compute creates. A
+  synthetic probe on the same machine (one to three threads creating 2 MB graphics pipelines of 8-10 s each, with
+  and without `VK_NV_device_diagnostics_config` and a shared pipeline cache) never held a submission past 80 ms.
+  While
   a create of a kind that holds submissions is in the driver, no submission goes ahead, at the limit or the budget,
   and such a create is waited for even when one went past it before the verdict: the title then starves as long as
   the create lasts (its watchdog may end the run), but the device is kept. On a device loss the log names every create
