@@ -3449,6 +3449,15 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   complete CPU read. Copies of descriptors written earlier resolve to the fallback until that upload succeeds.
   `LEONIDA_TITLE_IMAGE_DEFER=0` allocates these textures eagerly. The memory probe reports the live unbound
   image count and its Vulkan memory requirements in MiB.
+- With `LEONIDA_TITLE_PARTIAL_MIPS=1`, such a texture can be filled before all its pages are readable. The XG
+  layout of a 2D texture of one slice stores its mips from the smallest to the largest, so the mips from `m` on are
+  the first `mip_chain_bytes(layout, m)` bytes from its base (`xg_xs_layout.h`; checked in `xg_xs_test` for tiled,
+  tail and linear layouts). The probe (`texture_memory_readable_bytes`) returns how many bytes from the base are
+  readable and `first_mip_within` the first mip those hold. When the last slot-70 view starts at that mip or later,
+  the mips from there on are filled and only the descriptor keys of views that start there or later are published.
+  The others stay on the fallback (`PendingImage::first_mip`) until a later fill has their mips. The image still has
+  memory for every mip: `LEONIDA_TITLE_PARTIAL_MIPS_MB` (2048) limits the image memory of the textures filled in
+  part. Arrays, cubes and volumes are filled whole or not at all.
 - Small optimal Vulkan images synthesized for slot-70 texture views share memory pages. Each slice meets the
   image's size, alignment and memory type requirements. The GPU retirement queue destroys the image before its
   slice can be reused. Large images, dedicated-only images, and failed pool allocations use individual memory
