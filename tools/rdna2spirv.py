@@ -15982,6 +15982,30 @@ def dedupe_types(text):
     return pattern.sub(lambda m: alias[m.group(0)], "\n".join(out))
 
 
+def ms_prim_indices(c):
+    """The mesh epilogue's primitive: from %mpr (the `exp prim` word) and %msv (the vertex count), %mnb = bit 31
+    (null primitive) as 0/1, %mnull as a bool and %mi0..%mi2 the three indices. The 9-bit fields leave out the edge
+    flags. GFX10 epilogues mark a primitive null when a field is at or past the vertex count and keep the field, but
+    Vulkan leaves such an index undefined even on a culled primitive (VK_EXT_mesh_shader), so a null primitive's
+    indices are 0 and the others are clamped to the vertex count - 1, as Mesa 22.3 clamps them (ac_nir_lower_ngg.c
+    line 4112). A primitive is written only when %msv > 0 (the primitive count is 0 otherwise)."""
+    L = [f"%mnb = OpShiftRightLogical %uint %mpr {c(31)}", f"%mnull = OpINotEqual %bool %mnb {c(0)}",
+         f"%mvl = OpISub %uint %msv {c(1)}"]
+    for k in range(3):
+        src = f"%mfr{k}" if k else "%mpr"
+        if k:
+            L.append(f"%mfr{k} = OpShiftRightLogical %uint %mpr {c(10 * k)}")
+        L += [f"%mfi{k} = OpBitwiseAnd %uint {src} {c(0x1FF)}", f"%mci{k} = OpExtInst %uint %glsl UMin %mfi{k} %mvl",
+              f"%mi{k} = OpSelect %uint %mnull {c(0)} %mci{k}"]
+    return L
+
+
+def ms_prim_count(c, maxp):
+    """%msp from the allocation's primitive count %msp0: clamped to PSV0's maximum, and 0 without a vertex."""
+    return [f"%mspc = OpExtInst %uint %glsl UMin %msp0 {c(maxp)}", f"%mvz = OpIEqual %bool %msv {c(0)}",
+            f"%msp = OpSelect %uint %mvz {c(0)} %mspc"]
+
+
 def mesh_compute_epilogue(gen):
     """--mesh-compute: the mesh epilogue as buffer stores. Same barrier and counts as the mesh path; then lane 0
     writes the header, lane i < vertex count its vertex and lane i < primitive count its primitive, at the offsets
@@ -15992,7 +16016,7 @@ def mesh_compute_epilogue(gen):
          f"%msv0 = OpBitwiseAnd %uint %msc {c(0xFFF)}", f"%msp1 = OpShiftRightLogical %uint %msc {c(12)}",
          f"%msp0 = OpBitwiseAnd %uint %msp1 {c(0xFFF)}",
          f"%msv = OpExtInst %uint %glsl UMin %msv0 {c(gen.ms['maxv'])}",
-         f"%msp = OpExtInst %uint %glsl UMin %msp0 {c(gen.ms['maxp'])}",
+         *ms_prim_count(c, gen.ms['maxp']),
          "%mli = OpLoad %uint %local_index",
          # Slot base = output address (push-constant dwords 36..37, or --pc-tail-ubo dwords 4..5) + linear
          # workgroup index * slot bytes.
@@ -16068,16 +16092,12 @@ def mesh_compute_epilogue(gen):
             vals.append(f"%mq{loc}_{i}")
         store_floats(at("%mvb", off), vals)
     L += ["OpBranch %msc_vend", "%msc_vend = OpLabel"]
-    # Primitive mli: three 9-bit indices and the null-primitive bit (bit 31), as in the mesh path.
+    # Primitive mli: three indices and the null-primitive bit (bit 31), as in the mesh path.
     L += ["%mhp = OpLoad %bool %ms_has_prim", "%mpi = OpULessThan %bool %mli %msp",
           "%mwp = OpLogicalAnd %bool %mhp %mpi",
           "OpSelectionMerge %msc_pend None", "OpBranchConditional %mwp %msc_pdo %msc_pend", "%msc_pdo = OpLabel",
           f"%mps = OpIMul %uint %mli {c(16)}", f"%mpb = OpIAdd %uint %mps {c(lay['primitives'])}",
-          "%mpr = OpLoad %uint %ms_prim",
-          f"%mi0 = OpBitwiseAnd %uint %mpr {c(0x1FF)}",
-          f"%mr1 = OpShiftRightLogical %uint %mpr {c(10)}", f"%mi1 = OpBitwiseAnd %uint %mr1 {c(0x1FF)}",
-          f"%mr2 = OpShiftRightLogical %uint %mpr {c(20)}", f"%mi2 = OpBitwiseAnd %uint %mr2 {c(0x1FF)}",
-          f"%mnb = OpShiftRightLogical %uint %mpr {c(31)}"]
+          "%mpr = OpLoad %uint %ms_prim", *ms_prim_indices(c)]
     for i, w in enumerate(("%mi0", "%mi1", "%mi2", "%mnb")):
         store(at("%mpb", 4 * i), w)
     L += ["OpBranch %msc_pend", "%msc_pend = OpLabel"]
@@ -17084,7 +17104,7 @@ def assemble(gen):
              f"%msv0 = OpBitwiseAnd %uint %msc {c(0xFFF)}", f"%msp1 = OpShiftRightLogical %uint %msc {c(12)}",
              f"%msp0 = OpBitwiseAnd %uint %msp1 {c(0xFFF)}",
              f"%msv = OpExtInst %uint %glsl UMin %msv0 {c(gen.ms['maxv'])}",
-             f"%msp = OpExtInst %uint %glsl UMin %msp0 {c(gen.ms['maxp'])}",
+             *ms_prim_count(c, gen.ms['maxp']),
              "OpSetMeshOutputsEXT %msv %msp",
              "%mli = OpLoad %uint %local_index",
              "%mhv = OpLoad %bool %ms_has_vtx", "%mvi = OpULessThan %bool %mli %msv",
@@ -17129,13 +17149,9 @@ def assemble(gen):
               "%mwp = OpLogicalAnd %bool %mhp %mpi",
               "OpSelectionMerge %ms_pend None", "OpBranchConditional %mwp %ms_pdo %ms_pend",
               "%ms_pdo = OpLabel",
-              "%mpr = OpLoad %uint %ms_prim",
-              f"%mi0 = OpBitwiseAnd %uint %mpr {c(0x1FF)}",
-              f"%mr1 = OpShiftRightLogical %uint %mpr {c(10)}", f"%mi1 = OpBitwiseAnd %uint %mr1 {c(0x1FF)}",
-              f"%mr2 = OpShiftRightLogical %uint %mpr {c(20)}", f"%mi2 = OpBitwiseAnd %uint %mr2 {c(0x1FF)}",
+              "%mpr = OpLoad %uint %ms_prim", *ms_prim_indices(c),
               "%mix = OpCompositeConstruct %v3uint %mi0 %mi1 %mi2",
               "%mixp = OpAccessChain %_ptr_Out_v3u_ms %ms_prim_idx %mli", "OpStore %mixp %mix",
-              f"%mnb = OpShiftRightLogical %uint %mpr {c(31)}", "%mnull = OpINotEqual %bool %mnb %c0",
               f"%mcp = OpAccessChain %_ptr_Out_bool_ms %ms_cull %mli {c(0)}",
               # CullPrimitiveEXT gets a constant on each side of a branch, not the computed bool: llvmpipe
               # (Mesa 25.2.8, LLVM 20) aborts compiling a computed per-primitive bool store in the wave64-emulated
