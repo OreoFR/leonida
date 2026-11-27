@@ -3978,6 +3978,10 @@ if(TARGET Vulkan::Headers)
       # the title's pages at the next refresh, and the title's own newer words still win (#1537, WRITE_INVALID).
       add_test(NAME d3d12_title_window_write_back COMMAND d3d12_title_va_test --window-writeback)
       set_tests_properties(d3d12_title_window_write_back PROPERTIES SKIP_RETURN_CODE 77)
+      # No window nothing reaches: a stream-pool request just before an extent stops where it starts, and a window a
+      # slot-133 buffer replaced is retired at the next submission, its bytes returned and its memory freed.
+      add_test(NAME d3d12_title_window_orphans COMMAND d3d12_title_va_test --window-orphans)
+      set_tests_properties(d3d12_title_window_orphans PROPERTIES SKIP_RETURN_CODE 77)
       # The same return copy for a slot-133 buffer's shadow (the write-back of a compute result the title reads again).
       add_test(NAME d3d12_placed_write_back COMMAND d3d12_title_va_test --placed-writeback)
       set_tests_properties(d3d12_placed_write_back PROPERTIES SKIP_RETURN_CODE 77)
