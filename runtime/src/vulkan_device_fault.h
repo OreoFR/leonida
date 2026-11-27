@@ -420,8 +420,9 @@ public:
     // let_submit_finish), so one submission could slip in between and come back quickly from a driver that does hold
     // submissions; a second one a second later must be as lucky. It costs no extra wait: once one has gone ahead,
     // the next ones enter at once while that create is still in the driver. One held probe keeps the gate on for the
-    // rest of the run (the turn also covers presents and idle waits, which can take that long on their own, so a held
-    // probe may be a false alarm; it only keeps the bounded gate, never less protection). LEONIDA_COMPILE_GATE=1 gates
+    // rest of the run. Only submissions (vkQueueSubmit, vkQueueBindSparse) probe: presents and idle or semaphore waits
+    // pass the gate as submissions do, but take seconds on their own while the GPU is busy, so their time in the driver
+    // judges nothing. LEONIDA_COMPILE_GATE=1 gates
     // without probing, LEONIDA_COMPILE_GATE=0 turns the gate off. let_submit_finish is unaffected by all of this.
     //
     // The first probes come early: while no verdict is in, a submission also goes ahead once the submissions' waits at
@@ -481,6 +482,7 @@ public:
         std::uint32_t creates = 0;      // such creates in the driver then
         std::uint8_t kinds = 0;         // their kinds, bit per CreateKind
         bool went_ahead = false;        // it waited at the gate up to the limit or the probe budget
+        bool probe = true;              // its time in the driver is a probe (a submission, not a present or a wait)
     };
     class CompileTurn {  // around vkCreate*Pipelines
     public:
@@ -498,7 +500,12 @@ public:
     };
     class SubmitTurn {  // around vkQueueSubmit, with the submit lock held
     public:
-        explicit SubmitTurn(SubmitMutex& gate) : gate_(gate) { gate.enter_submit(&ahead_); }
+        // `probe` false for a present or an idle or semaphore wait: it waits at the gate like a submission, but its
+        // time in the driver judges nothing (it can take seconds on its own while the GPU is busy).
+        explicit SubmitTurn(SubmitMutex& gate, bool probe = true) : gate_(gate) {
+            gate.enter_submit(&ahead_);
+            ahead_.probe = probe;
+        }
         ~SubmitTurn() { gate_.leave_submit(ahead_); }
         SubmitTurn(const SubmitTurn&) = delete;
         SubmitTurn& operator=(const SubmitTurn&) = delete;
@@ -566,6 +573,28 @@ public:
     }
     static std::int64_t default_gate_wait_limit_ms() { return gate_defaults().wait_ms; }
     static std::int64_t default_gate_probe_budget_ms() { return gate_defaults().probe_ms; }
+    // How long a submission waits for creates of a kind that holds submissions before it goes ahead anyway
+    // (LEONIDA_COMPILE_GATE_HELD_WAIT_MS, 0: until they leave). Longer than the plain limit: going ahead there means
+    // waiting in the driver, where the device was lost once (a 54 s submission beside a 56 s mesh create on 621.40,
+    // the gate off); a false "holds" verdict costs at most this per create instead of the rest of the run.
+    static constexpr std::int64_t kDefaultHeldWaitMs = 60000;
+    static std::int64_t default_gate_held_limit_ms() {
+        static const std::int64_t ms = [] {
+            const char* value = std::getenv("LEONIDA_COMPILE_GATE_HELD_WAIT_MS");
+            if (!value || !*value) return kDefaultHeldWaitMs;
+            char* end = nullptr;
+            const long long n = std::strtoll(value, &end, 10);
+            if (end && !*end && n >= 0) return std::int64_t{n};
+            std::fprintf(stderr, "[rt] compile-gate: LEONIDA_COMPILE_GATE_HELD_WAIT_MS=%s is not a number of "
+                                 "milliseconds; ignored\n", value);
+            return kDefaultHeldWaitMs;
+        }();
+        return ms;
+    }
+    void set_gate_held_limit_ms(std::int64_t ms) {  // for tests
+        std::lock_guard lock(gate_mutex_);
+        held_limit_ms_ = (std::max)(ms, std::int64_t{0});
+    }
     std::int64_t gate_wait_limit_ms() {
         std::lock_guard lock(gate_mutex_);
         return wait_limit_ms_;
@@ -631,9 +660,7 @@ public:
         std::lock_guard lock(gate_mutex_);
         for (auto it = in_driver_.begin(); it != in_driver_.end(); ++it)
             if (it->seq == seq) {
-                const std::size_t k = std::size_t(it->info.kind);
-                last_leave_ms_[k] = diagnostic_ms();
-                last_leave_seq_[k] = seq;
+                recent_leaves_[leave_count_++ % kRecentLeaves] = Leave{seq, diagnostic_ms(), it->info.kind};
                 in_driver_.erase(it);
                 break;
             }
@@ -669,21 +696,24 @@ public:
             } else if (budget > 0 && (window_ms = recent_waits_ms(now) + waited) >= budget) {
                 why = "probe budget";
             }
-            if (why && held_blocking()) {
-                // Never into the driver beside a create of a kind that holds submissions: there it would wait for
-                // the create anyway, and the driver lost the device under such waits (621.40, a mesh create). It
-                // waits here for those, however long.
+            if (why && why[0] != 'h' && held_blocking()) {
+                // Not into the driver beside a create of a kind that holds submissions: there it would wait for the
+                // create anyway, and the driver lost the device under such waits (621.40, a mesh create). It waits
+                // here for those, up to the held limit (LEONIDA_COMPILE_GATE_HELD_WAIT_MS; 0: however long).
                 if (logged_held_waits_++ < 8)
                     std::fprintf(stderr, "[rt] compile-gate: vkQueueSubmit on thread %u reached the %s after %lld ms, "
                                          "but a create of a kind that holds submissions is in the driver: it waits "
-                                         "until that create leaves\n",
-                                 self, why, static_cast<long long>(waited));
+                                         "until that create leaves or %lld ms have passed\n",
+                                 self, why, static_cast<long long>(waited), static_cast<long long>(held_limit_ms_));
                 why = nullptr;
-                limit = budget = 0;
+                budget = 0;
+                limit = held_limit_ms_;
+                if (limit > 0 && waited >= limit) why = "held limit";
             }
             if (why) {
                 // Every create in the driver now stops holding submissions back; later ones are waited for.
                 overdue_through_ = last_create_;
+                if (why[0] == 'h') held_overdue_through_ = last_create_;
                 gate_changed_.notify_all();
                 break;
             }
@@ -717,6 +747,11 @@ public:
                                      "create(s) still in the driver hold no submission back from now on (%llu "
                                      "submissions went ahead so far)\n",
                              static_cast<long long>(limit), creates, static_cast<unsigned long long>(stats_.ahead));
+            else if (why[0] == 'h')
+                std::fprintf(stderr, "[rt] compile-gate: at the %lld ms held limit (LEONIDA_COMPILE_GATE_HELD_WAIT_MS): "
+                                     "the %u create(s) still in the driver hold no submission back from now on, those "
+                                     "of a kind that holds submissions included (%llu submissions went ahead so far)\n",
+                             static_cast<long long>(limit), creates, static_cast<unsigned long long>(stats_.ahead));
             else
                 std::fprintf(stderr, "[rt] compile-gate: the waits of the last %lld s add up to %lld ms, the probe "
                                      "budget is %lld ms (LEONIDA_COMPILE_GATE_PROBE_MS): the %u create(s) still in the "
@@ -734,7 +769,7 @@ public:
     void leave_submit(const GateAhead& ahead = {}) {
         if (!compile_gate_enabled()) return;
         std::lock_guard lock(gate_mutex_);
-        if (ahead.since_ms >= 0) probe(ahead);
+        if (ahead.since_ms >= 0 && ahead.probe) probe(ahead);
         if (--submits_ == 0) gate_changed_.notify_all();
     }
 
@@ -775,11 +810,13 @@ private:
     // gone past at the limit or the budget.
     bool is_blocking(const InDriver& c) const {
         if (kind_off(c.info.kind)) return false;
-        return verdict_[std::size_t(c.info.kind)] == GateVerdict::driver_holds || c.seq > overdue_through_;
+        if (verdict_[std::size_t(c.info.kind)] == GateVerdict::driver_holds) return c.seq > held_overdue_through_;
+        return c.seq > overdue_through_;
     }
     bool held_blocking() const {
         for (const auto& c : in_driver_)
-            if (verdict_[std::size_t(c.info.kind)] == GateVerdict::driver_holds) return true;
+            if (verdict_[std::size_t(c.info.kind)] == GateVerdict::driver_holds && c.seq > held_overdue_through_)
+                return true;
         return false;
     }
     const InDriver* first_blocking() const {
@@ -860,9 +897,12 @@ private:
             if (!(ahead.kinds & (1u << k))) continue;
             if (took >= kProbeHeldMs) {
                 // Held behind a create of this kind only if one it entered beside has just left.
-                const bool left_just_before = last_leave_seq_[k] != 0 && last_leave_seq_[k] <= ahead.last_create &&
-                                              last_leave_ms_[k] >= ahead.since_ms &&
-                                              now - last_leave_ms_[k] <= kHeldReturnMs;
+                bool left_just_before = false;
+                for (std::size_t i = 0; i < (std::min)(leave_count_, kRecentLeaves) && !left_just_before; ++i) {
+                    const Leave& l = recent_leaves_[i];
+                    left_just_before = std::size_t(l.kind) == k && l.seq <= ahead.last_create &&
+                                       l.ms >= ahead.since_ms && now - l.ms <= kHeldReturnMs;
+                }
                 if (left_just_before) {
                     judge(CreateKind(k), took, now);
                 } else if (logged_not_held_++ < 8) {
@@ -955,6 +995,8 @@ private:
     std::vector<InDriver> in_driver_;    // the creates in the driver now, oldest first
     std::uint64_t last_create_ = 0;      // the number of the last create that entered
     std::uint64_t overdue_through_ = 0;  // creates up to this number were in the driver when a submission went ahead
+    std::uint64_t held_overdue_through_ = 0;  // the same, for creates of a kind that holds (at the held limit)
+    std::int64_t held_limit_ms_ = default_gate_held_limit_ms();  // 0: no limit
     std::uint32_t submits_ = 0;   // submissions waiting for them or in the driver
     std::int64_t wait_limit_ms_ = default_gate_wait_limit_ms();  // 0: no limit
     std::int64_t probe_budget_ms_ = default_gate_probe_budget_ms();  // 0: no early probes
@@ -964,9 +1006,16 @@ private:
     // Per CreateKind.
     std::array<GateVerdict, kKinds> verdict_{GateVerdict::pending, GateVerdict::pending};
     std::array<bool, kKinds> rearmed_{};
-    // When the last create of each kind left the driver, and its number: a held probe needs one to have just left.
-    std::array<std::int64_t, kKinds> last_leave_ms_{};
-    std::array<std::uint64_t, kKinds> last_leave_seq_{};
+    // The last creates to leave the driver: a held probe needs one it entered beside to have just left. A ring, so a
+    // later create leaving does not hide an earlier one that did.
+    struct Leave {
+        std::uint64_t seq = 0;
+        std::int64_t ms = 0;
+        CreateKind kind{};
+    };
+    static constexpr std::size_t kRecentLeaves = 64;
+    std::array<Leave, kRecentLeaves> recent_leaves_{};
+    std::size_t leave_count_ = 0;
     unsigned logged_not_held_ = 0;
     std::array<unsigned, kKinds> quick_probes_{};
     std::array<std::int64_t, kKinds> first_quick_ms_{}, longest_quick_ms_{};

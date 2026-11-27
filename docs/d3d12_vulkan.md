@@ -2986,10 +2986,14 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   counted as held, it re-armed the gate, which then kept the next submission 78 s behind compute creates. A
   synthetic probe on the same machine (one to three threads creating 2 MB graphics pipelines of 8-10 s each, with
   and without `VK_NV_device_diagnostics_config` and a shared pipeline cache) never held a submission past 80 ms.
-  While
-  a create of a kind that holds submissions is in the driver, no submission goes ahead, at the limit or the budget,
-  and such a create is waited for even when one went past it before the verdict: the title then starves as long as
-  the create lasts (its watchdog may end the run), but the device is kept. On a device loss the log names every create
+  The recent leaves are kept in a ring, so a create that entered after the submission and left after the one it
+  entered beside does not hide that one. Only submissions (`vkQueueSubmit`, `vkQueueBindSparse`) probe: presents and
+  idle or semaphore waits pass the gate the same way but can take seconds on their own, so they judge nothing. While
+  a create of a kind that holds submissions is in the driver, no submission goes ahead at the limit or the budget,
+  and such a create is waited for even when one went past it before the verdict, up to the held limit
+  (`LEONIDA_COMPILE_GATE_HELD_WAIT_MS`, 60 s; 0 waits however long): then the creates in the driver are gone past
+  and the next submissions no longer wait for them. A false "holds" verdict so costs at most that per create, not the
+  rest of the run. On a device loss the log names every create
   in the driver (kind, program, SPIR-V size, thread, how long it had been there, whether submissions waited for it)
   and each kind's gate. Long graphics creates would leave the title's process only through the compile helper, which
   builds compute pipelines alone today.

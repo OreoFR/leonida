@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -617,13 +618,156 @@ int gate_per_kind() {
     return 0;
 }
 
+// A create that stays in the "driver" until `release` is set; `in` is set once it is there, `left_at` when it leaves.
+struct HeldCreate {
+    std::atomic<bool> in{false}, release{false};
+    std::atomic<std::int64_t> left_at{0};
+    std::thread thread;
+    HeldCreate(SubmitMutex& m, const SubmitMutex::CreateInfo& info) {
+        thread = std::thread([&m, info, this] {
+            const SubmitMutex::CompileTurn turn(m, info);
+            in = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+            left_at = now_ms();
+        });
+    }
+    void let_go() {
+        release = true;
+        if (thread.joinable()) thread.join();
+    }
+    ~HeldCreate() { let_go(); }
+};
+
+// The cases raised in review of #2412: a later create leaving does not hide an earlier one, presents and waits do
+// not probe, and a kind that holds submissions is waited for up to the held limit only.
+int gate_review_cases() {
+    if (!SubmitMutex::compile_gate_enabled()) {
+        std::printf("compile gate off (LEONIDA_COMPILE_GATE=0): review cases not checked\n");
+        return 0;
+    }
+    using Verdict = SubmitMutex::GateVerdict;
+    using Kind = SubmitMutex::CreateKind;
+    const SubmitMutex::CreateInfo compute{Kind::compute, "test compute", "test", 1000};
+    const auto turn_compute_off = [&](SubmitMutex& m, HeldCreate& c) {
+        { const SubmitMutex::SubmitTurn turn(m); }
+        std::this_thread::sleep_for(1100ms);
+        { const SubmitMutex::SubmitTurn turn(m); }
+        return m.gate_verdict(Kind::compute) == Verdict::driver_does_not_hold && c.in.load();
+    };
+    // A, there when the submission entered, leaves; then B, which entered after it, leaves; then the submission comes
+    // back. A's leave still counts: re-armed.
+    for (const bool a_first : {true, false}) {
+        SubmitMutex m;
+        m.set_gate_adaptive(true);
+        m.set_gate_wait_limit_ms(100);
+        m.set_gate_probe_budget_ms(0);
+        HeldCreate a(m, compute);
+        const bool off = eventually([&] { return a.in.load(); }) && turn_compute_off(m, a);
+        std::unique_ptr<HeldCreate> b;
+        {
+            const SubmitMutex::SubmitTurn turn(m);
+            b = std::make_unique<HeldCreate>(m, compute);  // enters after the submission did
+            EXPECT(eventually([&] { return b->in.load(); }));
+            std::this_thread::sleep_for(2000ms);
+            if (a_first) {
+                a.let_go();
+                std::this_thread::sleep_for(30ms);
+                b->let_go();
+            } else {
+                b->let_go();
+                std::this_thread::sleep_for(30ms);
+                a.let_go();
+            }
+            std::this_thread::sleep_for(50ms);
+        }
+        EXPECT(off);
+        EXPECT(m.gate_verdict(Kind::compute) == Verdict::driver_holds);
+    }
+    std::printf("compile gate: A then B and B then A leaving just before a 2.1 s submission both re-arm compute\n");
+    // B alone leaves (it entered after the submission), A is still there: not held.
+    {
+        SubmitMutex m;
+        m.set_gate_adaptive(true);
+        m.set_gate_wait_limit_ms(100);
+        m.set_gate_probe_budget_ms(0);
+        HeldCreate a(m, compute);
+        const bool off = eventually([&] { return a.in.load(); }) && turn_compute_off(m, a);
+        {
+            const SubmitMutex::SubmitTurn turn(m);
+            HeldCreate b(m, compute);
+            EXPECT(eventually([&] { return b.in.load(); }));
+            std::this_thread::sleep_for(2000ms);
+            b.let_go();
+            std::this_thread::sleep_for(50ms);
+        }
+        EXPECT(off);
+        EXPECT(m.gate_verdict(Kind::compute) == Verdict::driver_does_not_hold);
+    }
+    std::printf("compile gate: a create that entered after the submission leaving does not re-arm compute\n");
+    // A present or wait (probe false) that comes back 2.1 s later, just after the create left, judges nothing.
+    {
+        SubmitMutex m;
+        m.set_gate_adaptive(true);
+        m.set_gate_wait_limit_ms(100);
+        m.set_gate_probe_budget_ms(0);
+        HeldCreate a(m, compute);
+        EXPECT(eventually([&] { return a.in.load(); }));
+        {
+            const SubmitMutex::SubmitTurn turn(m, false);
+            std::this_thread::sleep_for(2000ms);
+            a.let_go();
+            std::this_thread::sleep_for(50ms);
+        }
+        EXPECT(m.gate_verdict(Kind::compute) == Verdict::pending);
+    }
+    std::printf("compile gate: a 2.1 s present or wait judges nothing\n");
+    // A kind that holds is waited for up to the held limit, then gone past; the next submission does not wait for it.
+    {
+        SubmitMutex m;
+        m.set_gate_adaptive(true);
+        m.set_gate_wait_limit_ms(100);
+        m.set_gate_probe_budget_ms(0);
+        m.set_gate_held_limit_ms(400);
+        {
+            HeldCreate first(m, compute);
+            EXPECT(eventually([&] { return first.in.load(); }));
+            const SubmitMutex::SubmitTurn turn(m);
+            std::this_thread::sleep_for(2000ms);
+            first.let_go();
+            std::this_thread::sleep_for(50ms);
+        }
+        const Verdict held = m.gate_verdict(Kind::compute);
+        HeldCreate stays(m, compute);
+        EXPECT(eventually([&] { return stays.in.load(); }));
+        std::int64_t waited = 0, next_waited = 0;
+        bool ahead = false;
+        {
+            const std::int64_t start = now_ms();
+            const SubmitMutex::SubmitTurn turn(m);
+            waited = now_ms() - start;
+            ahead = turn.went_ahead();
+        }
+        {
+            const std::int64_t start = now_ms();
+            const SubmitMutex::SubmitTurn turn(m);
+            next_waited = now_ms() - start;
+        }
+        EXPECT(held == Verdict::driver_holds);
+        EXPECT(ahead && waited >= 390 && waited < 2000);
+        EXPECT(next_waited < 50);
+        std::printf("compile gate: with a holding kind a submission waited %lld ms (held limit 400 ms), the next %lld ms\n",
+                    static_cast<long long>(waited), static_cast<long long>(next_waited));
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (owner_tracking() || waits_for_holder() || waits_for_queued_submitter() || handoff_is_capped() ||
         compile_gate() || gate_wait_limit() || gate_adapts() ||
-        gate_probe_budget() || gate_per_kind())
+        gate_probe_budget() || gate_per_kind() || gate_review_cases())
         return 1;
     std::printf("submit_mutex_test: all passed\n");
     return 0;
