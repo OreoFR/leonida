@@ -531,6 +531,7 @@ class Gen:
         self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
         self.emulate_inline = False  # emulate: current block emits direct inline barriers (no x_split)
         self.emulate_plan = None   # emulate: structured plan from wave64_emulate_opt.plan_structured_emulation
+        self.x_one_lane = False    # emulate: emitting a fold that at most one lane of the wave runs ("one_lane")
         self.mini_segs = defaultdict(list)  # emulate_plan: mini_idx -> continuation segment ids
         self.tail_segs = []        # emulate_plan: continuation segment ids belonging to tail_scheduler
         self.x_seg = 0             # emulate: number of the next continuation segment (past the block numbers)
@@ -6135,7 +6136,8 @@ class Gen:
         store = "store" in op or op.startswith("ds_write")
         reads = not store
         writes = store or "atomic" in op or (kind == "lds" and not op.startswith("ds_read"))
-        if (kind, "w") in self.x_dirty or (writes and (kind, "r") in self.x_dirty):
+        # In a fold that at most one lane of the wave runs, that lane's own order is the wave's.
+        if not self.x_one_lane and ((kind, "w") in self.x_dirty or (writes and (kind, "r") in self.x_dirty)):
             self.x_order_barrier()
         if reads:
             self.x_dirty.add((kind, "r"))
@@ -8099,6 +8101,10 @@ class Gen:
             if a[1]["k"] == "vgpr" and ("v", a[1]["r"]) in self.cur_masks:
                 # A lane mask that went through the vector unit (three SGPRs ORed with v_or3_b32, say). The
                 # hardware reads the first lane's copy of the whole mask; here the lane's own copy is its bit.
+                self.dst(a[0], self.src_u(a[1]))
+                return
+            if self.x_one_lane:
+                # A fold that at most one lane runs and that leaves EXEC alone: this lane is the first in EXEC.
                 self.dst(a[0], self.src_u(a[1]))
                 return
             if self.wave32_fragment:
@@ -18864,8 +18870,12 @@ def _translate(path):
     folds, fold_chain, absorbed = {}, {}, set()
     if g.emulate:
         g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
+        # v0 is LocalInvocationId.x (the prologue) and a wave is 64 consecutive threads, so no two lanes of a wave
+        # share v0 when the group is one row of x or a row is a whole number of waves.
+        sx, sy, sz = g.cs["size"] if stage == "cs" else (0, 0, 0)
+        tid = frozenset({0}) if stage == "cs" and (sy * sz == 1 or sx % 64 == 0) else frozenset()
         folds, fold_chain, absorbed = wave64_emulate_opt.find_local_exec_folds(
-            blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes)
+            blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes, tid)
         if STRUCTURED and WAVE64_PLAN:
             g.emulate_plan = wave64_emulate_opt.plan_structured_emulation(
                 blocks, raw_edges, succ, folds, fold_chain, absorbed, g.lane_masks, g.scc_live, g.x_lanes)
@@ -18892,6 +18902,7 @@ def _translate(path):
         g.emit(f"{lbl_do} = OpLabel")
         marks_before = len(g.x_marks)
         body_before = len(g.body)
+        g.x_one_lane = fd["one_lane"]
         if fd["sub_tree"] is None:
             for ins in blocks[fd["run"]]:
                 op = base_op(ins["op"])
@@ -18985,6 +18996,7 @@ def _translate(path):
                     g.emit(f"{again} = OpIEqual %bool {v} {g.cu(sub_id)}")
                     g.emit(f"OpBranchConditional {again} {head} {end}")
                     g.emit(f"{end} = OpLabel")
+        g.x_one_lane = False
         assert len(g.x_marks) == marks_before, "wave64 emulation: x_split inside a folded lane-local region"
         assert not any("OpControlBarrier" in l for l in g.body[body_before:]), \
             "wave64 emulation: OpControlBarrier inside a folded lane-local region"
