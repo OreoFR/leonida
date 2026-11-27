@@ -303,7 +303,7 @@ Current limits, by design:
 
 The `xgameruntime` shim (`shims/xgameruntime.cpp`) answers the title's questions about the console and its package
 with fixed values. Six environment variables change an answer, for trying another of the title's code paths. Each
-is read on every call, and a value that is empty or too long for its buffer is ignored.
+is read on every call, and a value that is empty or too long for its buffer is ignored; the row marked *diagnostic* only adds log lines.
 `tests/test_docs_env_vars.py` fails when the runtime or `make_game.py` reads a `LEONIDA_*` variable that no
 document names.
 
@@ -315,6 +315,7 @@ document names.
 | `LEONIDA_CONTENT_PACKAGES` | unset | The content packages `XPackageMount` can mount: `id1=path1;id2=path2` (up to 1,023 characters). The mount path of a listed identifier is its path, as written; any other identifier is `ERROR_NOT_FOUND`, and a path longer than 259 characters is `ERROR_INSUFFICIENT_BUFFER`. |
 | `LEONIDA_PACKAGED` | `1` | `0`, or text that is not a number, makes `XPackageIsPackagedProcess` return false. Any other number keeps it true. |
 | `LEONIDA_TITLE_MEMORY_MB` | unset | Caps the title memory limit (in MiB, clamped to `2048..65536`) reported by both `XSystemGetAppMemoryUsageLimit` (`xgameruntime.cpp`) and `XMemGetWorkingSetStatistics` (`xmem.cpp`). Useful on 16 GB RAM / low-VRAM hosts to prevent oversized title pools; invalid or non-positive values are ignored and fall back to the host memory report. |
+| `LEONIDA_TRACE_XGAMESAVE` | unset | *Diagnostic.* `1` logs one `[rt] xgamesave:` line to stderr per `XGameSave*` and `XGameSaveFiles*` call (`shims/xgameruntime_gamesave.cpp`): the call, its handles, container and blob names, sizes and HRESULT, after `t=<ms since the process started>ms tid=<thread>`. An async call also logs when its job is scheduled, when its work runs (with how long it waited on the queue), when it completes and when the title collects it with the `...Result` call. Blob contents are never logged. Read once per process; unset, a call costs one load. |
 | `LEONIDA_STACKS` | unset | Comma-separated whole seconds after the title's entry point is called (e.g. `90,180`). At each time `--run` suspends every other thread in turn just long enough to copy its context and stack, then unwinds the copy (title frames through the unwind tables the loader registers) and prints to stderr `[rt] stacks t=<s> thread <tid> (<thread description, or start address>):` and up to 40 `#i module+0xRVA` frames, innermost first; a chain identical to an earlier thread's prints `same as thread <tid>`. |
 
 ### Switches of the D3D12 layer for a retail boot
