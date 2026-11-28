@@ -272,65 +272,6 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
     return true;
 }
 
-// MONITORX (0F 01 FA) and MWAITX (0F 01 FB) are AMD-only spin-wait instructions. On Intel hosts every execution
-// raises #UD; under Wine each #UD costs tens of microseconds. Rewrite bare 3-byte sites in place at their first
-// #UD: MONITORX becomes a 3-byte NOP (0F 1F 00) and MWAITX becomes PAUSE; NOP (F3 90 90). The 3 bytes are swapped
-// via an atomic 32-bit compare-exchange kept strictly within the instruction's 4 KiB page so concurrent threads
-// executing the same site never observe a torn intermediate encoding. Prefixed and page-straddling forms fall back
-// to per-fault emulation. LEONIDA_MONITORX_PATCH=0 keeps emulating every execution instead.
-inline bool patch_monitorx_mwaitx(uint64_t rip, Op op, const uint8_t* code, std::size_t length) {
-    static const bool enabled = [] {
-        char value[4]{};
-        return !(GetEnvironmentVariableA("LEONIDA_MONITORX_PATCH", value, sizeof(value)) > 0 && value[0] == '0');
-    }();
-    if (!enabled || length != 3) return false;
-    const uint8_t modrm = (op == Op::monitorx) ? 0xFA : 0xFB;
-    if (code[0] != 0x0F || code[1] != 0x01 || code[2] != modrm) return false;
-    // Keep the 4-byte atomic window inside one 4 KiB page; straddling sites (>= 0xFFE) stay on per-fault emulation.
-    if ((rip & 0xFFFu) > 0xFFDu) return false;
-    const bool shift_back = (rip & 0xFFFu) == 0xFFDu;
-    const uint64_t window_addr = shift_back ? rip - 1 : rip;
-    const std::size_t off = shift_back ? 1 : 0;
-    const uint8_t target[3] = {uint8_t(op == Op::monitorx ? 0x0F : 0xF3),
-                               uint8_t(op == Op::monitorx ? 0x1F : 0x90),
-                               uint8_t(op == Op::monitorx ? 0x00 : 0x90)};
-    static SRWLOCK patch_lock = SRWLOCK_INIT;
-    AcquireSRWLockExclusive(&patch_lock);
-    bool ok = false;
-    const auto* live = reinterpret_cast<const uint8_t*>(rip);
-    if (live[0] == target[0] && live[1] == target[1] && live[2] == target[2]) {
-        ok = true;
-    } else if (live[0] == 0x0F && live[1] == 0x01 && live[2] == modrm) {
-        DWORD old = 0;
-        if (VirtualProtect(reinterpret_cast<void*>(window_addr), 4, PAGE_EXECUTE_READWRITE, &old)) {
-            uint8_t before[4]{}, after[4]{};
-            std::memcpy(before, reinterpret_cast<const void*>(window_addr), 4);
-            std::memcpy(after, before, 4);
-            after[off] = target[0];
-            after[off + 1] = target[1];
-            after[off + 2] = target[2];
-            LONG expected = 0, desired = 0;
-            std::memcpy(&expected, before, 4);
-            std::memcpy(&desired, after, 4);
-            const LONG observed = InterlockedCompareExchange(
-                reinterpret_cast<volatile LONG*>(window_addr), desired, expected);
-            DWORD unused = 0;
-            VirtualProtect(reinterpret_cast<void*>(window_addr), 4, old, &unused);
-            FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(rip), 3);
-            if (observed == expected) {
-                ok = true;
-                static std::atomic<unsigned> sites{0};
-                const unsigned n = ++sites;
-                if (n <= 8 || !(n & (n - 1)))
-                    std::fprintf(stderr, "[rt] cpu: %s at %p rewritten as %s (%u sites so far)\n", name(op),
-                                 reinterpret_cast<void*>(rip), op == Op::monitorx ? "3-byte NOP" : "PAUSE; NOP", n);
-            }
-        }
-    }
-    ReleaseSRWLockExclusive(&patch_lock);
-    return ok;
-}
-
 inline uint64_t gpr_read(const CONTEXT* c, int r) {
     switch (r) {
     case 0: return c->Rax;   case 1: return c->Rcx;   case 2: return c->Rdx;   case 3: return c->Rbx;
@@ -418,6 +359,15 @@ inline ClzeroLoopResult try_clzero_loop(const uint8_t* code, std::size_t avail, 
 // Threads of that worker reach the same site together: a #UD handled after another thread rewrote the site finds
 // the new instruction there and continues at it, and the rewrite itself is done once, under a lock.
 
+// The one lock every in-place rewrite of the game's code takes (CLWB here, MONITORX/MWAITX below). Each unprotects
+// the page, checks, writes and protects it again, and sites of both kinds share pages: with a lock each, one rewrite
+// could set a page back to read-execute while the other still writes into it, or record the read-write-execute
+// protection the other set and restore that.
+inline SRWLOCK& code_patch_lock() {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    return lock;
+}
+
 // 1: rewrite as CLFLUSHOPT, 2: as the NOP (no CLFLUSHOPT on this host), 0: LEONIDA_CLWB_PATCH=0.
 inline int clwb_patch_mode() {
     static const int mode = [] {
@@ -467,7 +417,7 @@ inline bool patch_clwb(uint64_t rip, const uint8_t* code, std::size_t length) {
     volatile uint8_t* const live = static_cast<volatile uint8_t*>(where);
     // One thread at a time unprotects, checks, writes and protects again: without the lock a thread could write into
     // a page another one has just set back to read-execute, or set it back to the read-write-execute it found.
-    static SRWLOCK lock = SRWLOCK_INIT;
+    SRWLOCK& lock = code_patch_lock();
     AcquireSRWLockExclusive(&lock);
     bool ok = live[1] == opcode && live[2] == modrm;  // another thread rewrote it since this thread's #UD
     bool wrote = false;
@@ -493,6 +443,85 @@ inline bool patch_clwb(uint64_t rip, const uint8_t* code, std::size_t length) {
     return ok;
 }
 
+// MONITORX (0F 01 FA) and MWAITX (0F 01 FB) are AMD-only spin-wait instructions. On Intel hosts every execution
+// raises #UD; under Wine each #UD costs tens of microseconds. Bare 3-byte sites are rewritten in place at their first
+// #UD: MONITORX becomes a 3-byte NOP (0F 1F 00) and MWAITX becomes PAUSE; NOP (F3 90 90). Prefixed forms and sites
+// that cross a cache line keep per-fault emulation. LEONIDA_MONITORX_PATCH=0 keeps emulating every execution instead.
+// As for CLWB, a #UD handled after another thread rewrote the site continues at it, and the rewrite is done once,
+// under code_patch_lock.
+
+inline bool monitorx_patch_enabled() {
+    static const bool enabled = [] {
+        char value[4]{};
+        return !(GetEnvironmentVariableA("LEONIDA_MONITORX_PATCH", value, sizeof(value)) > 0 && value[0] == '0');
+    }();
+    return enabled;
+}
+
+// How many MONITORX/MWAITX sites were rewritten so far; each counts once, by the thread that wrote it.
+inline std::atomic<unsigned>& monitorx_sites() {
+    static std::atomic<unsigned> sites{0};
+    return sites;
+}
+
+// The 3 bytes patch_monitorx_mwaitx writes over a bare MONITORX or MWAITX.
+inline const uint8_t* monitorx_target(Op op) {
+    static const uint8_t nop3[3] = {0x0F, 0x1F, 0x00}, pause_nop[3] = {0xF3, 0x90, 0x90};
+    return op == Op::monitorx ? nop3 : pause_nop;
+}
+
+// True when `code` (`avail` bytes at a #UD) starts with exactly one of those two forms: another thread rewrote the
+// site after this thread's #UD. Neither raises #UD on any CPU, so the thread continues at the site and the CPU runs it.
+inline bool monitorx_rewritten(const uint8_t* code, std::size_t avail) {
+    if (!monitorx_patch_enabled() || avail < 3) return false;
+    return !std::memcmp(code, monitorx_target(Op::monitorx), 3) || !std::memcmp(code, monitorx_target(Op::mwaitx), 3);
+}
+
+inline bool patch_monitorx_mwaitx(uint64_t rip, Op op, const uint8_t* code, std::size_t length) {
+    if (!monitorx_patch_enabled() || length != 3) return false;
+    const uint8_t modrm = op == Op::monitorx ? 0xFA : 0xFB;
+    if (code[0] != 0x0F || code[1] != 0x01 || code[2] != modrm) return false;
+    // The site is rewritten by one store, a 4-byte compare-exchange, so a thread running it sees the old instruction
+    // (a #UD, continued above) or the new one, never a mix. A mix would not be harmless: MONITORX's last byte before
+    // its middle one leaves 0F 01 00, SGDT [rax], a 10-byte store at the monitored address; one or two of MWAITX's
+    // three bytes give ADD ebx,edi, SETO bl, LGDT (#GP) or STI (#GP). The 4 bytes stay inside one 64-byte cache line,
+    // so inside one page too, and an instruction fetch reads the line from before or after the store; a site that
+    // crosses a line (offset 62 or 63 in it) could be fetched half old, half new, so it stays on per-fault emulation.
+    if ((rip & 63) > 61) return false;
+    const uint64_t window = (rip & 63) <= 60 ? rip : rip - 1;  // the site and the byte after it, or before it
+    const std::size_t off = std::size_t(rip - window);
+    const uint8_t* const target = monitorx_target(op);
+    volatile uint8_t* const live = reinterpret_cast<volatile uint8_t*>(rip);
+    SRWLOCK& lock = code_patch_lock();
+    AcquireSRWLockExclusive(&lock);
+    bool ok = live[0] == target[0] && live[1] == target[1] && live[2] == target[2];  // another thread rewrote it
+    bool wrote = false;
+    DWORD old = 0;
+    if (!ok && live[0] == 0x0F && live[1] == 0x01 && live[2] == modrm &&
+        VirtualProtect(reinterpret_cast<void*>(window), 4, PAGE_EXECUTE_READWRITE, &old)) {
+        uint8_t bytes[4];
+        for (std::size_t i = 0; i < 4; ++i) bytes[i] = reinterpret_cast<volatile uint8_t*>(window)[i];
+        LONG expected = 0, desired = 0;
+        std::memcpy(&expected, bytes, 4);
+        std::memcpy(bytes + off, target, 3);
+        std::memcpy(&desired, bytes, 4);
+        // Only rewrites change code, under the lock, so the compare fails only if something else did; then this
+        // execution is emulated and the site left as it is.
+        wrote = InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(window), desired, expected) == expected;
+        VirtualProtect(reinterpret_cast<void*>(window), 4, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(rip), 3);
+        ok = wrote;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    if (wrote) {
+        const unsigned n = ++monitorx_sites();
+        if (n <= 8 || !(n & (n - 1)))
+            std::fprintf(stderr, "[rt] cpu: %s at %p rewritten as %s (%u sites so far)\n", name(op),
+                         reinterpret_cast<void*>(rip), op == Op::monitorx ? "a 3-byte NOP" : "PAUSE; NOP", n);
+    }
+    return ok;
+}
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = info->ContextRecord;
@@ -501,7 +530,8 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     std::memcpy(code, reinterpret_cast<const void*>(c->Rip), avail);
     const Decoded d = decode(code, avail);
     if (d.op == Op::none)
-        return clwb_rewritten(code, avail) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+        return clwb_rewritten(code, avail) || monitorx_rewritten(code, avail) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                               : EXCEPTION_CONTINUE_SEARCH;
     if (d.op == Op::clwb && patch_clwb(c->Rip, code, d.length)) return EXCEPTION_CONTINUE_EXECUTION;
     EXCEPTION_RECORD fault;
     if (d.op == Op::clzero && !d.addr32 && d.length == 3) {

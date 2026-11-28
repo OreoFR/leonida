@@ -547,6 +547,151 @@ void test_clwb_rewrite() {
     std::printf("clwb rewrite: %d threads x %d sites\n", kThreads, kSites);
     VirtualFree(mem, 0, MEM_RELEASE);
 }
+
+// ---- MONITORX/MWAITX rewritten in place, the same way ----
+
+bool monitorx_patch_off() {
+    char value[4]{};
+    return GetEnvironmentVariableA("LEONIDA_MONITORX_PATCH", value, sizeof(value)) > 0 && value[0] == '0';
+}
+
+// monitorx; ret (0F 01 FA C3) became 0F 1F 00 C3, or mwaitx; ret (0F 01 FB C3) became F3 90 90 C3.
+bool monitorx_rewritten(const uint8_t* at, bool mwaitx) {
+    return at[3] == 0xC3 && (mwaitx ? at[0] == 0xF3 && at[1] == 0x90 && at[2] == 0x90
+                                    : at[0] == 0x0F && at[1] == 0x1F && at[2] == 0x00);
+}
+
+void test_monitorx_rewrite() {
+    if (monitorx_patch_off()) {
+        std::printf("monitorx rewrite: skipped (LEONIDA_MONITORX_PATCH=0)\n");
+        return;
+    }
+    constexpr int kSites = 2048, kStride = 8, kThreads = 16;
+    const std::size_t bytes = std::size_t(kSites + 2) * kStride;
+    auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    check(mem != nullptr, "monitorx rewrite: allocate the sites");
+    if (!mem) return;
+    for (int s = 0; s < kSites + 2; ++s) {  // monitorx (even sites) or mwaitx (odd ones); ret; int3 x4
+        const uint8_t site[kStride] = {0x0F, 0x01, uint8_t(s & 1 ? 0xFB : 0xFA), 0xC3, 0xCC, 0xCC, 0xCC, 0xCC};
+        std::memcpy(mem + std::size_t(s) * kStride, site, kStride);
+    }
+    DWORD old = 0;
+    VirtualProtect(mem, bytes, PAGE_EXECUTE_READ, &old);  // as the game's code: the handler must unprotect it
+    FlushInstructionCache(GetCurrentProcess(), mem, bytes);
+
+    const unsigned before = ce::monitorx_sites().load();
+    for (int kind = 0; kind < 2; ++kind) {  // the two spare sites at the end: a MONITORX, then an MWAITX
+        uint8_t* const one = mem + std::size_t(kSites + kind) * kStride;
+        const uint64_t rip = reinterpret_cast<uint64_t>(one);
+        const char* const what = kind ? "mwaitx" : "monitorx";
+        char text[160];
+        // (a) The first #UD rewrites the site and continues at it, which then runs on any host.
+        uint64_t after = 0;
+        std::snprintf(text, sizeof text, "monitorx rewrite: the first #UD on a %s continues at the site", what);
+        check(fake_ud(rip, &after) == EXCEPTION_CONTINUE_EXECUTION && after == rip, text);
+        std::snprintf(text, sizeof text, "monitorx rewrite: the %s is rewritten, the next byte kept", what);
+        check(monitorx_rewritten(one, kind == 1) && one[4] == 0xCC, text);
+        check(ce::monitorx_sites().load() == before + unsigned(kind) + 1, "monitorx rewrite: the site is counted once");
+        check(executable_read_only(one), "monitorx rewrite: the page is execute-read again");
+        check(call_at(one, nullptr), "monitorx rewrite: the rewritten site runs");
+        // (b) A #UD handled after the site was rewritten (another thread's, in the game) continues at the site too.
+        after = 0;
+        std::snprintf(text, sizeof text, "monitorx rewrite: a #UD on an already rewritten %s continues at it", what);
+        check(fake_ud(rip, &after) == EXCEPTION_CONTINUE_EXECUTION && after == rip, text);
+        check(ce::monitorx_sites().load() == before + unsigned(kind) + 1,
+              "monitorx rewrite: an already rewritten site is not counted again");
+    }
+
+    // (c) 16 threads take a #UD on each of 2048 fresh sites at once, in the same order so they meet on each site.
+    std::atomic<int> waiting{kThreads}, bad{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+        threads.emplace_back([&] {
+            waiting.fetch_sub(1);
+            while (waiting.load()) std::this_thread::yield();
+            for (int s = 0; s < kSites; ++s) {
+                const uint64_t at = reinterpret_cast<uint64_t>(mem + std::size_t(s) * kStride);
+                uint64_t continued = 0;
+                if (fake_ud(at, &continued) != EXCEPTION_CONTINUE_EXECUTION || continued != at) bad.fetch_add(1);
+            }
+        });
+    for (auto& t : threads) t.join();
+    if (bad.load()) std::fprintf(stderr, "monitorx rewrite: %d of %d concurrent #UDs not continued at the site\n",
+                                 bad.load(), kThreads * kSites);
+    check(bad.load() == 0, "monitorx rewrite: every concurrent #UD continues at its site");
+    const unsigned counted = ce::monitorx_sites().load() - before - 2;
+    if (counted != unsigned(kSites))
+        std::fprintf(stderr, "monitorx rewrite: %u sites counted for %d\n", counted, kSites);
+    check(counted == unsigned(kSites), "monitorx rewrite: each concurrently hit site is counted once");
+    bool all = true;
+    for (int s = 0; s < kSites; ++s) all &= monitorx_rewritten(mem + std::size_t(s) * kStride, (s & 1) != 0);
+    check(all, "monitorx rewrite: every concurrently hit site is rewritten");
+    check(executable_read_only(mem) && executable_read_only(mem + bytes - 1),
+          "monitorx rewrite: the pages are execute-read again");
+    std::printf("monitorx rewrite: %d threads x %d sites\n", kThreads, kSites);
+    VirtualFree(mem, 0, MEM_RELEASE);
+}
+
+// CLWB and MONITORX/MWAITX sites side by side on the same pages, rewritten from several threads at once: both
+// rewrites change the protection of those pages, so they must take the same lock. With one lock each, a thread can
+// write into a page another just set back to execute-read (an access violation in the handler) or restore the
+// read-write-execute protection the other set.
+void test_mixed_rewrite() {
+    char value[4]{};
+    if (monitorx_patch_off() ||
+        (GetEnvironmentVariableA("LEONIDA_CLWB_PATCH", value, sizeof(value)) > 0 && value[0] == '0')) {
+        std::printf("mixed rewrite: skipped (LEONIDA_CLWB_PATCH=0 or LEONIDA_MONITORX_PATCH=0)\n");
+        return;
+    }
+    constexpr int kSites = 3 * 1024, kStride = 8, kThreads = 16;  // 24 KiB: 6 pages of 512 sites each
+    const std::size_t bytes = std::size_t(kSites) * kStride;
+    auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    check(mem != nullptr, "mixed rewrite: allocate the sites");
+    if (!mem) return;
+    for (int s = 0; s < kSites; ++s) {  // clwb [rcx]; ret, monitorx; ret, mwaitx; ret in turn
+        static const uint8_t sites[3][kStride] = {{0x66, 0x0F, 0xAE, 0x31, 0xC3, 0xCC, 0xCC, 0xCC},
+                                                  {0x0F, 0x01, 0xFA, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC},
+                                                  {0x0F, 0x01, 0xFB, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC}};
+        std::memcpy(mem + std::size_t(s) * kStride, sites[s % 3], kStride);
+    }
+    DWORD old = 0;
+    VirtualProtect(mem, bytes, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), mem, bytes);
+    const unsigned clwb_before = ce::clwb_sites().load(), monitorx_before = ce::monitorx_sites().load();
+
+    // Half the threads walk the sites forwards and half backwards, so rewrites of both kinds run on a page together.
+    std::atomic<int> waiting{kThreads}, bad{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+        threads.emplace_back([&, t] {
+            waiting.fetch_sub(1);
+            while (waiting.load()) std::this_thread::yield();
+            for (int i = 0; i < kSites; ++i) {
+                const int s = t & 1 ? kSites - 1 - i : i;
+                const uint64_t at = reinterpret_cast<uint64_t>(mem + std::size_t(s) * kStride);
+                uint64_t continued = 0;
+                if (fake_ud(at, &continued) != EXCEPTION_CONTINUE_EXECUTION || continued != at) bad.fetch_add(1);
+            }
+        });
+    for (auto& t : threads) t.join();
+    if (bad.load()) std::fprintf(stderr, "mixed rewrite: %d of %d concurrent #UDs not continued at the site\n",
+                                 bad.load(), kThreads * kSites);
+    check(bad.load() == 0, "mixed rewrite: every concurrent #UD continues at its site");
+    check(ce::clwb_sites().load() - clwb_before == unsigned(kSites / 3) &&
+              ce::monitorx_sites().load() - monitorx_before == unsigned(kSites / 3 * 2),
+          "mixed rewrite: each site is counted once, by its own kind");
+    bool all = true;
+    for (int s = 0; s < kSites; ++s) {
+        const uint8_t* const at = mem + std::size_t(s) * kStride;
+        all &= s % 3 == 0 ? clwb_rewritten(at) : monitorx_rewritten(at, s % 3 == 2);
+    }
+    check(all, "mixed rewrite: every site is rewritten");
+    bool read_only = true;
+    for (std::size_t page = 0; page < bytes; page += 0x1000) read_only &= executable_read_only(mem + page);
+    check(read_only, "mixed rewrite: every page is execute-read again");
+    std::printf("mixed rewrite: %d threads x %d sites (CLWB, MONITORX, MWAITX)\n", kThreads, kSites);
+    VirtualFree(mem, 0, MEM_RELEASE);
+}
 }  // namespace
 
 int main() {
@@ -559,6 +704,8 @@ int main() {
     check(ce::install(), "install the handler");
     test_live(host);
     test_clwb_rewrite();
+    test_monitorx_rewrite();
+    test_mixed_rewrite();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
